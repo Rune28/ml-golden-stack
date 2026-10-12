@@ -19,7 +19,12 @@ output "service_urls" {
   value = { for name, m in var.port_mappings : name => "http://127.0.0.1:${m.host_port}" }
 }
 
-# Consumed by the platform layer (helm/kubernetes providers).
+output "gpu_mode" {
+  description = "`nvidia` when GPU nodes have real GPUs and need the NVIDIA device plugin."
+  value       = var.gpu_mode
+}
+
+# Consumed by the environment layer (helm/kubernetes providers).
 output "client_certificate" {
   value     = kind_cluster.this.client_certificate
   sensitive = true

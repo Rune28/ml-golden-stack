@@ -15,9 +15,11 @@ variable "node_pools" {
     Worker node pools. Each pool mimics a cloud node group: every node gets the
     label `node-pool = <pool name>` plus the pool's own labels and taints.
     Kueue ResourceFlavors will select pools by these labels.
+    Nodes of pools with `gpu = true` get a GPU according to `gpu_mode`.
   EOT
   type = map(object({
     count  = number
+    gpu    = optional(bool, false)
     labels = optional(map(string), {})
     taints = optional(list(object({
       key    = string
@@ -27,14 +29,17 @@ variable "node_pools" {
   }))
 
   default = {
+    # Three nodes, so replicated services can be spread one per node and
+    # survive the loss of a node.
     cpu = {
-      count  = 1
+      count  = 3
       labels = { "capacity-type" = "on-demand" }
     }
-    # No real GPU locally: this pool only reproduces the scheduling rules
-    # of a GPU node group (label + taint), workloads still run on CPU.
-    gpu-sim = {
+    # Named `gpu` like the cloud node group, so node selectors and Kueue
+    # flavors are the same in every environment.
+    gpu = {
       count  = 1
+      gpu    = true
       labels = { "capacity-type" = "spot" }
       taints = [{ key = "nvidia.com/gpu", value = "present", effect = "NoSchedule" }]
     }
@@ -53,6 +58,30 @@ variable "node_pools" {
     ]))
     error_message = "Taint effect must be NoSchedule, PreferNoSchedule or NoExecute."
   }
+}
+
+variable "gpu_mode" {
+  description = <<-EOT
+    How nodes of GPU pools get a GPU:
+    - `simulated`: no GPU needed. Nodes advertise a fake `nvidia.com/gpu`
+      resource, so GPU pods schedule as they would in the cloud but run on CPU.
+    - `nvidia` (experimental, not yet run end to end): the host's NVIDIA GPUs
+      are passed into the nodes. Requires the NVIDIA driver and
+      nvidia-container-toolkit on the host, see README.
+  EOT
+  type        = string
+  default     = "simulated"
+
+  validation {
+    condition     = contains(["simulated", "nvidia"], var.gpu_mode)
+    error_message = "gpu_mode must be simulated or nvidia."
+  }
+}
+
+variable "simulated_gpus_per_node" {
+  description = "Number of fake `nvidia.com/gpu` advertised by each GPU node in `simulated` mode."
+  type        = number
+  default     = 1
 }
 
 variable "port_mappings" {

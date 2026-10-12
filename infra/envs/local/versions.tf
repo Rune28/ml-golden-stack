@@ -17,8 +17,11 @@ terraform {
   }
 }
 
-# Cluster connection comes from the `infra/local` outputs, not from shared
+# Cluster connection comes from the cluster layer's outputs, not from shared
 # variables, so this layer can be applied and destroyed on its own.
+# The parts that differ per cloud live here: where the cluster state is
+# (local file vs S3/GCS) and how providers authenticate (client certificate
+# on kind vs `aws eks get-token` / Google access token).
 data "terraform_remote_state" "cluster" {
   backend = "local"
   config = {
