@@ -34,8 +34,3 @@ module "temporal" {
     nodePort = var.temporal_ui_node_port
   }
 }
-
-module "nvidia_device_plugin" {
-  source = "../../modules/nvidia-device-plugin"
-  count  = local.cluster.gpu_mode == "nvidia" ? 1 : 0
-}

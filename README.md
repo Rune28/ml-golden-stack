@@ -9,19 +9,102 @@ Reference stack for multi-model batch ML pipelines: OpenTofu, Kubernetes, Kueue 
 | Directory | Purpose | Status |
 |---|---|---|
 | `infra/clusters/kind` | local kind cluster | ✅ |
-| `infra/modules` | cloud-agnostic service modules: `temporal`, `postgres-local`, `nvidia-device-plugin` | ✅ Temporal, MLflow and MinIO planned |
+| `infra/modules` | cloud-agnostic service modules: `temporal`, `postgres-local` | ✅ Temporal, MLflow and MinIO planned |
 | `infra/envs/local` | local environment: wires the modules onto the kind cluster | ✅ |
 | `temporal` | Temporal workflows: pipeline orchestration, model promotion | planned |
 | `de_worker` | data engineering worker: video decoding, segmentation, I/O | planned |
 | `mle_models` | model steps behind a common batch interface | planned |
 
+## Services
+
+What runs in the local cluster. Dashed boxes are planned. For which pod ran on which node in one real run, see [docs/example-scheme.md](docs/example-scheme.md).
+
+```mermaid
+flowchart TB
+    host(["Host: browser, CLI"])
+
+    subgraph kind["kind cluster gold"]
+        direction TB
+        portmap["kind port mapping<br/>127.0.0.1:8080 → NodePort 30080"]
+
+        subgraph cpu["cpu pool · 3 nodes · nodeSelector node-pool=cpu"]
+            direction TB
+
+            subgraph ns_temporal["namespace: temporal"]
+                web["temporal-web<br/>UI"]
+                admin["temporal-admintools<br/>temporal CLI"]
+                nsjob[["Job: temporal-namespace<br/>namespace default, 3d retention"]]
+                schema[["Job: temporal-schema<br/>creates databases, runs migrations"]]
+
+                subgraph server["Temporal server"]
+                    fe["frontend<br/>gRPC :7233"]
+                    hist["history<br/>workflow state"]
+                    match["matching<br/>task queues"]
+                    tworker["worker<br/>system workflows"]
+                end
+
+                secret_t["Secret temporal-db"]
+            end
+
+            subgraph ns_pg["namespace: postgres"]
+                pg[("postgres-0 · StatefulSet<br/>databases temporal, temporal_visibility")]
+                pvc["PVC 2Gi · local-path"]
+                secret_p["Secret postgres"]
+            end
+        end
+
+        subgraph gpu["gpu pool · 1 node<br/>taint nvidia.com/gpu · simulated nvidia.com/gpu: 1"]
+            models["model steps"]:::planned
+        end
+    end
+
+    workers["pipeline workers<br/>de_worker, mle_models"]:::planned
+
+    host --> portmap --> web
+    web --> fe
+    admin --> fe
+    nsjob --> fe
+    fe --> hist
+    fe --> match
+    hist --> match
+    tworker --> fe
+    server -- "SQL :5432" --> pg
+    schema -- "pre-install" --> pg
+    secret_t -. password .-> server
+    secret_p -. password .-> pg
+    pg --- pvc
+    workers -. "temporal-frontend.temporal.svc:7233" .-> fe
+
+    classDef planned stroke-dasharray: 5 5,opacity:0.7
+```
+
 ## Infrastructure layers
 
-```
-infra/
-  clusters/<name>/   creates a Kubernetes cluster, exposes the cluster contract as outputs
-  modules/<service>/ one service, knows nothing about the cloud
-  envs/<name>/       reads a cluster's state, configures providers, wires modules
+```mermaid
+flowchart LR
+    subgraph c["infra/clusters/kind · creates the cluster · own state"]
+        pre["scripts/preflight.sh<br/>host checks"]
+        kindc["kind_cluster<br/>control-plane + 3 cpu + 1 gpu"]
+        gpun["terraform_data.gpu_nodes<br/>simulated nvidia.com/gpu"]
+    end
+
+    subgraph e["infra/envs/local · wires modules onto the cluster · own state"]
+        rs["terraform_remote_state<br/>reads cluster outputs"]
+        prov["providers<br/>kubernetes + helm"]
+    end
+
+    subgraph m["infra/modules · one service each, cloud agnostic"]
+        mpg["postgres-local<br/>namespace, StatefulSet, Secret"]
+        mt["temporal<br/>namespace, Secret, helm_release"]
+    end
+
+    pre -. "make infra-up" .-> kindc
+    kindc --> gpun
+    kindc -- "endpoint, certificates" --> rs
+    rs --> prov
+    prov --> mpg
+    prov --> mt
+    mpg -- "host, port, user, password" --> mt
 ```
 
 `clusters/*` and `envs/*` are separate OpenTofu root modules with separate state. An environment can be applied and destroyed without touching its cluster.
@@ -35,7 +118,7 @@ Everything cloud specific lives in `clusters/<name>` and `envs/<name>`:
 | Postgres | `modules/postgres-local` | RDS / Cloud SQL, same inputs to `modules/temporal` |
 | Temporal UI | NodePort + kind port mapping | Ingress or internal LoadBalancer |
 | History shards | 4 | 512 |
-| GPU device plugin | `modules/nvidia-device-plugin` when `gpu_mode = nvidia` | EKS: same module; GKE: installed by GKE |
+| GPU | simulated: fake `nvidia.com/gpu` on the `gpu` pool | real GPU node group; EKS: NVIDIA device plugin, GKE: built in |
 
 Moving to a cloud means adding `clusters/eks` and `envs/eks` (or `gke`); `modules/*` stay as they are.
 
@@ -46,7 +129,7 @@ Every cluster must provide:
 - worker pools labelled `node-pool=<name>`: `cpu` for platform services, `gpu` for model steps;
 - GPU nodes tainted `nvidia.com/gpu=present:NoSchedule` and advertising `nvidia.com/gpu`;
 - a default StorageClass;
-- outputs: `endpoint`, `cluster_ca_certificate`, credentials for the providers, `gpu_mode`.
+- outputs: `endpoint`, `cluster_ca_certificate`, credentials for the providers.
 
 Node selectors, tolerations and Kueue flavors written against this contract work unchanged in every environment.
 
@@ -60,42 +143,11 @@ Node selectors, tolerations and Kueue flavors written against this contract work
 
 Three `cpu` nodes let replicated services run one replica per node. Pools, sizes, labels and taints are configured through the `node_pools` variable.
 
-### GPU modes
+### Simulated GPU
 
-The `gpu` pool works with or without a GPU on the host, set by `gpu_mode`:
+The `gpu` pool has no real GPU. Its nodes advertise a fake `nvidia.com/gpu` resource (set by `infra/clusters/kind/scripts/setup-gpu-nodes.sh` after the cluster is created) and carry the label `gpu-simulated=true`.
 
-| Mode | GPU on the host | What the `gpu` nodes get |
-|---|---|---|
-| `simulated` (default) | not needed | a fake `nvidia.com/gpu` resource and the label `gpu-simulated=true`; GPU pods schedule as in the cloud but run on CPU |
-| `nvidia` ⚠️ experimental | NVIDIA GPU, driver, nvidia-container-toolkit | the real GPU, nvidia as the default containerd runtime, NVIDIA device plugin |
-
-In both modes pods request `nvidia.com/gpu` and tolerate the taint the same way, so manifests do not change between modes. Model code has to fall back to CPU when no CUDA device is present.
-
-> **`nvidia` mode is experimental.** It follows NVIDIA's nvkind but has not been run end to end yet. It changes the host's docker configuration and needs `sudo`. Use `simulated` unless you need a real GPU locally.
-
-To use a real GPU (Fedora; other distros: [NVIDIA install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)):
-
-```bash
-# 1. nvidia-container-toolkit on the host, nvidia as docker's default runtime
-curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
-  | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
-sudo dnf install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker --set-as-default --cdi.enabled
-sudo nvidia-ctk config --set accept-nvidia-visible-devices-as-volume-mounts=true --in-place
-sudo systemctl restart docker
-
-# 2. check that docker can pass the GPU into a container the way kind needs
-make gpu-check
-
-# 3. switch this machine to the nvidia mode (file is gitignored)
-echo 'gpu_mode = "nvidia"' > infra/clusters/kind/local.auto.tfvars
-```
-
-The nvidia runtime becomes docker's default for all containers on the host. Containers that do not ask for a GPU are not affected.
-
-Changing `gpu_mode` recreates the cluster: run `make platform-down` before `make infra-up`.
-
-The GPU node setup follows NVIDIA's [nvkind](https://github.com/NVIDIA/nvkind) and is done by `infra/clusters/kind/scripts/setup-gpu-nodes.sh` after the cluster is created.
+GPU pods request `nvidia.com/gpu` and tolerate the taint exactly as on cloud GPU nodes, so their manifests and Kueue flavors are the same everywhere. They schedule locally but run on CPU: model code has to fall back to CPU when no CUDA device is present.
 
 ### Exposed services
 
@@ -110,14 +162,14 @@ NodePort → `127.0.0.1`:
 ### Requirements
 
 - [OpenTofu](https://opentofu.org/docs/intro/install/) ≥ 1.8
-- Docker (Podman works with `KIND_EXPERIMENTAL_PROVIDER=podman`, experimental `gpu_mode = nvidia` is written for Docker only)
+- Docker (Podman works with `KIND_EXPERIMENTAL_PROVIDER=podman`)
 - kubectl
 - ~4 GB of free RAM for the cluster and platform services
 - Linux: raised inotify limits, see below
 
 The `kind` CLI is not required: the cluster is created by the `tehcyx/kind` provider.
 
-`make infra-up` runs `make preflight` first: it checks the tools, the docker daemon, inotify limits, free memory and, in `nvidia` mode, the GPU setup. It never changes the host, it prints the commands to fix what is missing.
+`make infra-up` runs `make preflight` first: it checks the tools, the docker daemon, inotify limits and free memory. It never changes the host, it prints the commands to fix what is missing.
 
 #### inotify limits
 
@@ -133,7 +185,7 @@ printf 'fs.inotify.max_user_watches = 524288\nfs.inotify.max_user_instances = 51
 
 ```bash
 make infra-up          # create the cluster
-make platform-up       # Postgres + Temporal (+ NVIDIA device plugin in nvidia mode)
+make platform-up       # Postgres + Temporal
 export KUBECONFIG=$PWD/infra/clusters/kind/.kubeconfig
 make infra-status      # nodes, pools, taints, GPUs
 make platform-status   # platform pods
@@ -177,7 +229,6 @@ temporal workflow list --address 127.0.0.1:7233
 | `tehcyx/kind` provider | `~> 0.11` | bundles kind v0.31 |
 | Kubernetes node image | `v1.35.0` | default image of kind v0.31, pinned by digest |
 | `temporalio/temporal` chart | `1.7.0` | server 1.32.0, UI 2.54.1 |
-| `nvidia-device-plugin` chart | `0.20.1` | |
 | Postgres | `17.11-alpine` | |
 | `hashicorp/helm` provider | `~> 3.3` | |
 | `hashicorp/kubernetes` provider | `~> 3.3` | |

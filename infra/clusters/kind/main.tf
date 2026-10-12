@@ -4,15 +4,10 @@ locals {
 
   gpu_pools = [for name, pool in var.node_pools : name if pool.gpu && pool.count > 0]
 
-  # `nvidia.com/gpu.present` is the label the NVIDIA device plugin schedules on.
-  # In the cloud it is set by node feature discovery or the node group itself.
-  gpu_labels = var.gpu_mode == "nvidia" ? { "nvidia.com/gpu.present" = "true" } : { "gpu-simulated" = "true" }
-
   workers = flatten([
     for pool_name, pool in var.node_pools : [
       for i in range(pool.count) : {
-        gpu    = pool.gpu
-        labels = merge({ "node-pool" = pool_name }, pool.labels, pool.gpu ? local.gpu_labels : {})
+        labels = merge({ "node-pool" = pool_name }, pool.labels, pool.gpu ? { "gpu-simulated" = "true" } : {})
         taints = pool.taints
       }
     ]
@@ -58,35 +53,22 @@ resource "kind_cluster" "this" {
             nodeRegistration = { taints = node.value.taints }
           })
         ]
-
-        # Asks the host's nvidia-container-runtime to inject all GPUs into the
-        # node container. Works only with `accept-nvidia-visible-devices-as-volume-mounts`
-        # enabled on the host, see README.
-        dynamic "extra_mounts" {
-          for_each = node.value.gpu && var.gpu_mode == "nvidia" ? [1] : []
-          content {
-            host_path      = "/dev/null"
-            container_path = "/var/run/nvidia-container-devices/all"
-          }
-        }
       }
     }
   }
 }
 
-# Makes GPU nodes look like cloud GPU nodes: either a real GPU behind the
-# nvidia runtime, or a fake `nvidia.com/gpu` resource. Runs on the host,
-# needs docker and kubectl.
+# Makes GPU nodes look like cloud GPU nodes to the scheduler: they advertise
+# a fake `nvidia.com/gpu` resource. Runs on the host, needs kubectl.
 resource "terraform_data" "gpu_nodes" {
   count = length(local.gpu_pools) > 0 ? 1 : 0
 
-  triggers_replace = [kind_cluster.this.id, var.gpu_mode, var.simulated_gpus_per_node]
+  triggers_replace = [kind_cluster.this.id, var.simulated_gpus_per_node]
 
   provisioner "local-exec" {
     command = "${path.module}/scripts/setup-gpu-nodes.sh"
     environment = {
       KUBECONFIG     = local.kubeconfig_path
-      GPU_MODE       = var.gpu_mode
       NODE_SELECTOR  = "node-pool in (${join(",", local.gpu_pools)})"
       SIMULATED_GPUS = var.simulated_gpus_per_node
     }

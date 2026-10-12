@@ -1,5 +1,33 @@
 # Backlog
 
+## Local platform
+
+### Highly available Postgres (CloudNativePG)
+
+Postgres is a single instance (`modules/postgres-local`, one replica on one node). If its node goes down, Temporal loses its database. The three `cpu` nodes are already there to spread instances over.
+
+- [ ] CloudNativePG operator installed by its helm chart (CRDs handled as in [Helm charts and CRDs](#helm-charts-and-crds))
+- [ ] New module `postgres-cnpg` replaces `postgres-local` in `envs/local`: a `Cluster` with 3 instances, one primary and two replicas
+- [ ] Instances spread one per `cpu` node (pod anti-affinity on `kubernetes.io/hostname`), PodDisruptionBudget
+- [ ] Automatic failover: when the primary goes down, a replica is promoted within seconds
+- [ ] Temporal connects to the `<cluster>-rw` service, which always points to the current primary. `modules/temporal` does not change, only `host`, `user` and `password` in `envs/local`
+- [ ] Failover drill: delete the primary pod, check that a replica is promoted and Temporal keeps serving (`temporal operator cluster health`, `temporal workflow list`)
+- [ ] Backups and WAL archive to MinIO, once MinIO is deployed. HA does not protect from `DROP TABLE`: it is replicated instantly
+
+### Real GPU on the local gpu node
+
+The `gpu` pool only simulates a GPU: a fake `nvidia.com/gpu` resource, pods run on CPU. Needed once a model step has to run on CUDA locally. Optional per machine: `simulated` stays the default for hosts without an NVIDIA GPU.
+
+A first version was written and never run end to end, then removed. It is in commit `8eaa66d` (`gpu_mode`, `setup-gpu-nodes.sh`, `modules/nvidia-device-plugin`, preflight checks, README section) and can be restored from there.
+
+- [ ] `gpu_mode` variable in `clusters/kind`: `simulated` (default) or `nvidia`, set per machine in the gitignored `local.auto.tfvars`
+- [ ] Host prerequisites documented, not automated (they need `sudo`): NVIDIA driver, nvidia-container-toolkit, nvidia as docker's default runtime, `accept-nvidia-visible-devices-as-volume-mounts = true`
+- [ ] `make preflight` checks the host prerequisites in `nvidia` mode
+- [ ] GPU node gets the host GPUs through the `/dev/null` → `/var/run/nvidia-container-devices/all` mount, the toolkit inside the node, nvidia as the default containerd runtime (steps of NVIDIA's [nvkind](https://github.com/NVIDIA/nvkind))
+- [ ] NVIDIA device plugin installed in `envs/local` in `nvidia` mode; GPU nodes labelled `nvidia.com/gpu.present=true`
+- [ ] End-to-end check: a pod requesting `nvidia.com/gpu: 1` on the `gpu` pool runs `nvidia-smi` and sees the host GPU
+- [ ] Model step manifests unchanged between `simulated` and `nvidia`
+
 ## Infrastructure: long-lived cluster
 
 Needed once the stack runs on a cluster that is updated in place (EKS) instead of being recreated like the local kind cluster. Goal: every change reaches a running cluster without downtime or data loss.

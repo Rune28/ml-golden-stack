@@ -15,7 +15,8 @@ variable "node_pools" {
     Worker node pools. Each pool mimics a cloud node group: every node gets the
     label `node-pool = <pool name>` plus the pool's own labels and taints.
     Kueue ResourceFlavors will select pools by these labels.
-    Nodes of pools with `gpu = true` get a GPU according to `gpu_mode`.
+    Nodes of pools with `gpu = true` advertise a simulated GPU, see
+    `simulated_gpus_per_node`.
   EOT
   type = map(object({
     count  = number
@@ -60,26 +61,12 @@ variable "node_pools" {
   }
 }
 
-variable "gpu_mode" {
-  description = <<-EOT
-    How nodes of GPU pools get a GPU:
-    - `simulated`: no GPU needed. Nodes advertise a fake `nvidia.com/gpu`
-      resource, so GPU pods schedule as they would in the cloud but run on CPU.
-    - `nvidia` (experimental, not yet run end to end): the host's NVIDIA GPUs
-      are passed into the nodes. Requires the NVIDIA driver and
-      nvidia-container-toolkit on the host, see README.
-  EOT
-  type        = string
-  default     = "simulated"
-
-  validation {
-    condition     = contains(["simulated", "nvidia"], var.gpu_mode)
-    error_message = "gpu_mode must be simulated or nvidia."
-  }
-}
-
 variable "simulated_gpus_per_node" {
-  description = "Number of fake `nvidia.com/gpu` advertised by each GPU node in `simulated` mode."
+  description = <<-EOT
+    Number of fake `nvidia.com/gpu` advertised by each node of a GPU pool.
+    There is no real GPU locally: GPU pods schedule as they would in the
+    cloud but run on CPU.
+  EOT
   type        = number
   default     = 1
 }

@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # Checks that the host can run the kind cluster, before it is created.
 # Only checks and prints fixes; never changes the host (fixes need sudo).
-#
-# Usage: preflight.sh [cluster dir]   (default: directory of this script's parent)
 set -uo pipefail
 
-dir=${1:-$(dirname "$0")/..}
 failed=0
 
 ok()   { printf '  ok    %s\n' "$1"; }
@@ -45,29 +42,6 @@ if [ "$(uname -s)" = Linux ]; then
     ok "free memory ${avail_mb} MiB"
   else
     warn "free memory ${avail_mb} MiB, the cluster and platform need about 4 GiB"
-  fi
-fi
-
-# GPU mode is a per-machine setting in the gitignored local.auto.tfvars.
-if grep -qsE '^\s*gpu_mode\s*=\s*"nvidia"' "$dir"/*.auto.tfvars; then
-  warn "gpu_mode = nvidia is experimental, see GPU modes in README"
-
-  if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
-    ok "NVIDIA driver"
-  else
-    fail "gpu_mode = nvidia, but nvidia-smi does not work" "install the NVIDIA driver, or remove gpu_mode from local.auto.tfvars"
-  fi
-
-  if [ "$(docker info --format '{{.DefaultRuntime}}' 2>/dev/null)" = nvidia ]; then
-    ok "docker default runtime is nvidia"
-  else
-    fail "gpu_mode = nvidia, but docker's default runtime is not nvidia" "see GPU modes in README, step 1"
-  fi
-
-  if grep -qsE '^\s*accept-nvidia-visible-devices-as-volume-mounts\s*=\s*true' /etc/nvidia-container-runtime/config.toml; then
-    ok "nvidia runtime accepts devices as volume mounts"
-  else
-    fail "accept-nvidia-visible-devices-as-volume-mounts is not enabled" "see GPU modes in README, step 1"
   fi
 fi
 

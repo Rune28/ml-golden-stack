@@ -5,10 +5,10 @@ KUBECONFIG  := $(abspath $(CLUSTER_DIR)/.kubeconfig)
 
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         platform-init platform-plan platform-up platform-down platform-status \
-        preflight gpu-check fmt validate
+        preflight fmt validate
 
 help:
-	@echo "preflight        check the host (tools, inotify limits, memory, GPU setup)"
+	@echo "preflight        check the host (tools, inotify limits, memory)"
 	@echo "infra-up         create the local kind cluster (runs preflight first)"
 	@echo "infra-down       destroy the local kind cluster (run platform-down first)"
 	@echo "infra-status     show nodes, pools, taints and GPUs"
@@ -17,7 +17,6 @@ help:
 	@echo "platform-down    uninstall platform services"
 	@echo "platform-status  show platform pods"
 	@echo "platform-plan    show planned changes to platform services"
-	@echo "gpu-check        check that the host can pass its NVIDIA GPU into kind"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
 
@@ -28,7 +27,7 @@ infra-plan: infra-init
 	$(TOFU) -chdir=$(CLUSTER_DIR) plan
 
 preflight:
-	@$(CLUSTER_DIR)/scripts/preflight.sh $(CLUSTER_DIR)
+	@$(CLUSTER_DIR)/scripts/preflight.sh
 
 infra-up: preflight infra-init
 	$(TOFU) -chdir=$(CLUSTER_DIR) apply -auto-approve
@@ -60,13 +59,6 @@ platform-status:
 	KUBECONFIG=$(KUBECONFIG) kubectl get pods -o wide -n postgres
 	@echo
 	KUBECONFIG=$(KUBECONFIG) kubectl get pods -o wide -n temporal
-	@-KUBECONFIG=$(KUBECONFIG) kubectl get pods -o wide -n nvidia 2>/dev/null
-
-# Same checks as NVIDIA's nvkind: the driver works, and docker injects the GPU
-# into a container through the /dev/null volume-mount trick that kind relies on.
-gpu-check:
-	nvidia-smi -L
-	docker run --rm -v /dev/null:/var/run/nvidia-container-devices/all ubuntu:24.04 nvidia-smi -L
 
 fmt:
 	$(TOFU) fmt -recursive

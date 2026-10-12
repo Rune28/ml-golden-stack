@@ -5,7 +5,3 @@ output "temporal_ui_url" {
 output "temporal_frontend_address" {
   value = module.temporal.frontend_address
 }
-
-output "gpu_mode" {
-  value = local.cluster.gpu_mode
-}
