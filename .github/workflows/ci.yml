@@ -28,7 +28,7 @@ jobs:
         working-directory: ${{ matrix.project }}
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # no moving major tag in this repo
         with:
           enable-cache: true
           cache-dependency-glob: ${{ matrix.project }}/uv.lock
