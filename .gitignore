@@ -5,6 +5,7 @@
 *.tfplan
 crash.log
 *.auto.tfvars
+*.auto.tfvars.json
 override.tf
 override.tf.json
 *_override.tf
@@ -18,3 +19,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .env
+.pytest_cache/
+
+# Rust
+**/target/
