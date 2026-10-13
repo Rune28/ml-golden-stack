@@ -40,9 +40,10 @@ locals {
     server = {
       replicaCount = var.replicas
       nodeSelector = var.node_selector
+      # Each service uses ~150-250 MiB at idle on a 4-shard cluster.
       resources = {
-        requests = { cpu = "100m", memory = "256Mi" }
-        limits   = { memory = "1Gi" }
+        requests = { cpu = "100m", memory = "128Mi" }
+        limits   = { memory = "512Mi" }
       }
 
       config = {

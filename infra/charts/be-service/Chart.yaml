@@ -1,0 +1,6 @@
+apiVersion: v2
+name: be-service
+description: "Backend of the pipeline page (Rust): Add data, Train and Run buttons"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

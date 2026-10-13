@@ -29,12 +29,13 @@ fi
 if [ "$(uname -s)" = Linux ]; then
   watches=$(sysctl -n fs.inotify.max_user_watches)
   instances=$(sysctl -n fs.inotify.max_user_instances)
-  if [ "$watches" -ge 524288 ] && [ "$instances" -ge 512 ]; then
+  # 512 instances proved too few for 5 nodes plus the desktop: kube-proxy
+  # crashed after a reboot. host-setup sets 8192.
+  if [ "$watches" -ge 524288 ] && [ "$instances" -ge 8192 ]; then
     ok "inotify limits (watches=$watches, instances=$instances)"
   else
     fail "inotify limits too low (watches=$watches, instances=$instances), kube-proxy will crash" \
-      "sudo sysctl fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512" \
-      "printf 'fs.inotify.max_user_watches = 524288\\nfs.inotify.max_user_instances = 512\\n' | sudo tee /etc/sysctl.d/99-kind.conf"
+      "make host-setup"
   fi
 
   avail_mb=$(awk '/MemAvailable/ {print int($2 / 1024)}' /proc/meminfo)

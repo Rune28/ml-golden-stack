@@ -2,109 +2,97 @@
 
 Reference stack for multi-model batch ML pipelines: OpenTofu, Kubernetes, Kueue and Temporal. Runs locally on kind and is designed to move to EKS or GKE by adding a cluster and an environment, without changing the service modules.
 
-> Work in progress. The local cluster and Temporal are implemented so far.
+> The first end-to-end pipeline runs: a page with three buttons adds MNIST data, trains a model on the (simulated) GPU pool and runs it, through Temporal, Kubernetes Jobs, ClickHouse and MLflow. Kueue, the cloud environments and the items in [BACKLOG.md](BACKLOG.md) are next.
 
 ## Layout
 
-| Directory | Purpose | Status |
-|---|---|---|
-| `infra/clusters/kind` | local kind cluster | ✅ |
-| `infra/modules` | cloud-agnostic service modules: `temporal`, `postgres-local` | ✅ Temporal, MLflow and MinIO planned |
-| `infra/envs/local` | local environment: wires the modules onto the kind cluster | ✅ |
-| `temporal` | Temporal workflows: pipeline orchestration, model promotion | planned |
-| `de_worker` | data engineering worker: video decoding, segmentation, I/O | planned |
-| `mle_models` | model steps behind a common batch interface | planned |
+| Directory | Purpose |
+|---|---|
+| `infra/clusters/kind` | local kind cluster |
+| `infra/modules` | cloud-agnostic modules, one service each: `postgres-local`, `postgres-database`, `temporal`, `seaweedfs-local`, `clickhouse-local`, `clickhouse-migrate`, `mlflow`, `de-worker`, `be-service` |
+| `infra/charts` | Helm charts of our own applications: `de-worker`, `be-service` |
+| `infra/envs/local` | local environment: wires the modules onto the kind cluster |
+| `db/clickhouse/migrations` | ClickHouse schema (golang-migrate, one statement per file) |
+| `be_service` | Rust: the page and its API. Adds data to ClickHouse, starts workflows in Temporal |
+| `de_worker` | Python: Temporal worker. Workflows `Train` and `Run`, activity `run_job` that runs a Kubernetes Job |
+| `mle_models` | Python: `mnist` (model code, no I/O) and `jobs` (the Job entry points: train, predict, promote) |
+| `scripts/images.sh` | builds the application images and loads them into kind |
 
 ## Services
 
-What runs in the local cluster. Dashed boxes are planned. For which pod ran on which node in one real run, see [docs/example-scheme.md](docs/example-scheme.md).
+What runs in the local cluster. For which pod ran on which node in one real run, see [docs/example-scheme.md](docs/example-scheme.md). The pipeline itself is described in [docs/first-pipeline.md](docs/first-pipeline.md).
 
 ```mermaid
 flowchart TB
-    host(["Host: browser, CLI"])
+    host(["Host: browser, make"])
 
     subgraph kind["kind cluster gold"]
         direction TB
-        portmap["kind port mapping<br/>127.0.0.1:8080 → NodePort 30080"]
 
-        subgraph cpu["cpu pool · 3 nodes · nodeSelector node-pool=cpu"]
+        subgraph cpu["cpu pool · 3 nodes"]
             direction TB
-
-            subgraph ns_temporal["namespace: temporal"]
-                web["temporal-web<br/>UI"]
-                admin["temporal-admintools<br/>temporal CLI"]
-                nsjob[["Job: temporal-namespace<br/>namespace default, 3d retention"]]
-                schema[["Job: temporal-schema<br/>creates databases, runs migrations"]]
-
-                subgraph server["Temporal server"]
-                    fe["frontend<br/>gRPC :7233"]
-                    hist["history<br/>workflow state"]
-                    match["matching<br/>task queues"]
-                    tworker["worker<br/>system workflows"]
-                end
-
-                secret_t["Secret temporal-db"]
+            be["be-service<br/>page + API · :9001"]
+            dw["de-worker<br/>Temporal worker, queue de"]
+            subgraph temporal["temporal"]
+                fe["frontend :7233"]
+                tsrv["history · matching · worker"]
+                web["web UI · :8080"]
             end
-
-            subgraph ns_pg["namespace: postgres"]
-                pg[("postgres-0 · StatefulSet<br/>databases temporal, temporal_visibility")]
-                pvc["PVC 2Gi · local-path"]
-                secret_p["Secret postgres"]
-            end
+            pg[("Postgres<br/>temporal, temporal_visibility, mlflow")]
+            ch[("ClickHouse<br/>ml_data.samples, ml_data.predictions")]
+            s3[("SeaweedFS (S3)<br/>buckets mlflow, pipeline")]
+            mlf["MLflow · :5000<br/>tracking + registry"]
+            jobp[["Job predict / promote"]]
         end
 
-        subgraph gpu["gpu pool · 1 node<br/>taint nvidia.com/gpu · simulated nvidia.com/gpu: 1"]
-            models["model steps"]:::planned
+        subgraph gpu["gpu pool · 1 node · taint nvidia.com/gpu · simulated GPU"]
+            jobt[["Job train"]]
         end
     end
 
-    workers["pipeline workers<br/>de_worker, mle_models"]:::planned
-
-    host --> portmap --> web
-    web --> fe
-    admin --> fe
-    nsjob --> fe
-    fe --> hist
-    fe --> match
-    hist --> match
-    tworker --> fe
-    server -- "SQL :5432" --> pg
-    schema -- "pre-install" --> pg
-    secret_t -. password .-> server
-    secret_p -. password .-> pg
-    pg --- pvc
-    workers -. "temporal-frontend.temporal.svc:7233" .-> fe
-
-    classDef planned stroke-dasharray: 5 5,opacity:0.7
+    host -- "Add data · Train · Run" --> be
+    be -- "insert batch" --> ch
+    be -- "start Train / Run" --> fe
+    fe --- tsrv
+    tsrv --> pg
+    dw -- "poll queue de" --> fe
+    dw -- "run_job: create Job, wait" --> jobt
+    dw --> jobp
+    jobt -- "read samples" --> ch
+    jobt -- "log run, register version" --> mlf
+    jobp -- "write predictions" --> ch
+    jobt & jobp -- "result.json" --> s3
+    mlf --> pg
+    mlf -- "artifacts" --> s3
+    be -. "model versions" .-> mlf
 ```
 
 ## Infrastructure layers
 
 ```mermaid
 flowchart LR
-    subgraph c["infra/clusters/kind · creates the cluster · own state"]
-        pre["scripts/preflight.sh<br/>host checks"]
+    subgraph c["infra/clusters/kind · own state"]
         kindc["kind_cluster<br/>control-plane + 3 cpu + 1 gpu"]
-        gpun["terraform_data.gpu_nodes<br/>simulated nvidia.com/gpu"]
+        gpun["simulated nvidia.com/gpu"]
     end
 
-    subgraph e["infra/envs/local · wires modules onto the cluster · own state"]
-        rs["terraform_remote_state<br/>reads cluster outputs"]
-        prov["providers<br/>kubernetes + helm"]
+    subgraph e["infra/envs/local · own state"]
+        rs["terraform_remote_state"]
+        imgs["images.auto.tfvars.json<br/>written by make platform-up"]
     end
 
-    subgraph m["infra/modules · one service each, cloud agnostic"]
-        mpg["postgres-local<br/>namespace, StatefulSet, Secret"]
-        mt["temporal<br/>namespace, Secret, helm_release"]
+    subgraph m["infra/modules"]
+        direction TB
+        data["postgres-local · seaweedfs-local · clickhouse-local"]
+        schema["postgres-database (mlflow) · clickhouse-migrate (Job)"]
+        svc["temporal (official chart) · mlflow"]
+        apps["de-worker · be-service<br/>own charts in infra/charts"]
     end
 
-    pre -. "make infra-up" .-> kindc
     kindc --> gpun
     kindc -- "endpoint, certificates" --> rs
-    rs --> prov
-    prov --> mpg
-    prov --> mt
-    mpg -- "host, port, user, password" --> mt
+    rs --> data --> schema --> svc --> apps
+    imgs --> apps
 ```
 
 `clusters/*` and `envs/*` are separate OpenTofu root modules with separate state. An environment can be applied and destroyed without touching its cluster.
@@ -115,8 +103,11 @@ Everything cloud specific lives in `clusters/<name>` and `envs/<name>`:
 |---|---|---|
 | Cluster state | local file | S3 / GCS |
 | Provider auth | client certificate | `aws eks get-token` / Google access token |
-| Postgres | `modules/postgres-local` | RDS / Cloud SQL, same inputs to `modules/temporal` |
-| Temporal UI | NodePort + kind port mapping | Ingress or internal LoadBalancer |
+| Postgres | `modules/postgres-local` | RDS / Cloud SQL, same inputs to `modules/temporal`, `modules/postgres-database` |
+| Object store | `modules/seaweedfs-local` (S3 API) | S3 / GCS: same endpoint, bucket and key inputs |
+| ClickHouse | `modules/clickhouse-local` | ClickHouse Cloud, same inputs to `clickhouse-migrate` and the applications |
+| Images | built locally, loaded into kind (`scripts/images.sh`) | pulled from GHCR, built by CI |
+| UIs (page, Temporal, MLflow) | NodePort + kind port mapping | Ingress or internal LoadBalancer |
 | History shards | 4 | 512 |
 | GPU | simulated: fake `nvidia.com/gpu` on the `gpu` pool | real GPU node group; EKS: NVIDIA device plugin, GKE: built in |
 
@@ -155,48 +146,103 @@ NodePort → `127.0.0.1`:
 
 | Service | URL |
 |---|---|
+| Pipeline page (be_service) | http://127.0.0.1:9001 |
 | Temporal UI | http://127.0.0.1:8080 |
-| MLflow | http://127.0.0.1:5000 (planned) |
-| MinIO console | http://127.0.0.1:9001 (planned) |
+| MLflow | http://127.0.0.1:5000 |
+
+ClickHouse and SeaweedFS stay inside the cluster; use `kubectl port-forward` for a look (see below).
 
 ### Requirements
 
 - [OpenTofu](https://opentofu.org/docs/intro/install/) ≥ 1.8
 - Docker (Podman works with `KIND_EXPERIMENTAL_PROVIDER=podman`)
 - kubectl
-- ~4 GB of free RAM for the cluster and platform services
+- ~6 GB of free RAM: cluster, platform services and a running train Job
 - Linux: raised inotify limits, see below
 
 The `kind` CLI is not required: the cluster is created by the `tehcyx/kind` provider.
 
-`make infra-up` runs `make preflight` first: it checks the tools, the docker daemon, inotify limits and free memory. It never changes the host, it prints the commands to fix what is missing.
+`make infra-up` runs `make preflight` first: it checks the tools, the docker daemon, inotify limits and free memory. It never changes the host, it prints what to run to fix what is missing.
 
 #### inotify limits
 
-Every kind node runs its own kubelet, containerd and kube-proxy, all using inotify on the host kernel. Distro defaults (usually 128 instances) are enough for about three nodes. With more, kube-proxy crashes with `too many open files` and pods lose access to services and DNS ([kind known issue](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files)). Raise the limits once:
+Every kind node runs its own kubelet, containerd and kube-proxy, all using inotify on the host kernel. Distro defaults (usually 128 instances) are enough for about three nodes. With more, kube-proxy crashes with `too many open files` and pods lose access to services and DNS ([kind known issue](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files)). Raise the limits once (asks for sudo, writes `/etc/sysctl.d/99-kind.conf` so they survive reboots):
 
 ```bash
-sudo sysctl fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512
-printf 'fs.inotify.max_user_watches = 524288\nfs.inotify.max_user_instances = 512\n' \
-  | sudo tee /etc/sysctl.d/99-kind.conf   # keep after reboot
+make host-setup
 ```
 
 ### Usage
 
 ```bash
 make infra-up          # create the cluster
-make platform-up       # Postgres + Temporal
+make platform-up       # build and load the images, install platform services and applications
 export KUBECONFIG=$PWD/infra/clusters/kind/.kubeconfig
 make infra-status      # nodes, pools, taints, GPUs
-make platform-status   # platform pods
+make platform-status   # all pods and pipeline Jobs
 
 make platform-down     # always before infra-down
 make infra-down
 ```
 
+`make platform-up` is the one command for everything above the cluster. It builds the three application images, tags them by content (`dev-<image id>`), loads into the kind nodes only what they miss, and applies `infra/envs/local`. A changed image gets a new tag and its pods roll; with nothing changed the apply is a no-op. `make platform-up IMAGES=remote TAG=sha-abc1234` takes the images CI published to GHCR instead.
+
+Do not run `make` with sudo: OpenTofu state written by root cannot be updated later without it.
+
 The kubeconfig is written to `infra/clusters/kind/.kubeconfig` (gitignored), so `~/.kube/config` is left untouched.
 
+## Pipeline
+
+Open http://127.0.0.1:9001 and press the buttons in order, or use make:
+
+```bash
+make add-data N=5000   # be_service adds the next 5000 MNIST examples as one batch
+make train POOL=gpu    # workflow Train: Job train on the gpu pool, promote if better
+make run               # workflow Run: the champion predicts all 10,000 test images
+```
+
+Adding data and training again shows the point of the demo: accuracy grows with the data (about 64% on 1,000 examples, 95% on 10,000, 98.5% on all 60,000), and a new version becomes `champion` only when it beats the current one.
+
+| Step | Who | Where the result goes |
+|---|---|---|
+| Add data | be_service, directly | `ml_data.samples`, one `batch_id` (UUID v7) per batch |
+| Train | Temporal `Train` → de_worker `run_job` → Job `train` | MLflow run + new version of `mnist-cnn`, `result.json` |
+| Promote | decided in the workflow, Job `promote` | MLflow alias `champion` |
+| Run | Temporal `Run` → Job `predict` | `ml_data.predictions` under the run's `run_id` |
+
+Contracts that hold the pieces together:
+
+- `batch_id` and `run_id` are generated by be_service per button press and travel through the workflow input, the Job arguments, ClickHouse and MLflow (`train_batches.json` lists the batches a model was trained on).
+- Workflow IDs are fixed (`train`, `run`): a second press while one runs is refused by Temporal.
+- `run_job` names the Job `<step>-<run_id>`: a retried activity finds the Job it created instead of starting the step again. Every step is idempotent: a partial batch or prediction run is rewritten, a complete one skipped.
+- The `mnist` package has no I/O; `jobs` does ClickHouse, MLflow and S3 around it.
+
 ## Platform services
+
+### Data and models
+
+| Service | Module | Notes |
+|---|---|---|
+| ClickHouse 26.8 | `clickhouse-local` | low-memory config (512 MiB cap, system log tables off); schema only from `db/clickhouse/migrations` |
+| ClickHouse migrations | `clickhouse-migrate` | stock `migrate/migrate` image, SQL from a ConfigMap; a new migration file means a new Job, nothing runs otherwise |
+| SeaweedFS 4.48 | `seaweedfs-local` | single `weed server` with the S3 gateway; a Job creates the buckets |
+| MLflow 3.17 | `mlflow` + `postgres-database` | own database and user in Postgres, artifacts in SeaweedFS through the server, `mlflow db upgrade` as an init container, background job execution off (~2 GiB less) |
+
+ClickHouse and SeaweedFS from the host:
+
+```bash
+kubectl -n clickhouse port-forward svc/clickhouse 8123:8123     # http://127.0.0.1:8123/play
+kubectl -n clickhouse get secret clickhouse -o jsonpath='{.data.password}' | base64 -d   # user: platform
+kubectl -n seaweedfs port-forward svc/seaweedfs 8888:8888       # filer UI: http://127.0.0.1:8888
+```
+
+### Applications
+
+| Application | Chart | Runs |
+|---|---|---|
+| be-service | `infra/charts/be-service` | one replica (Add data is serialized in-process), NodePort 30901 |
+| de-worker | `infra/charts/de-worker` | Role to create, watch and delete Jobs and read pod logs in `de-worker` only |
+| pipeline Jobs | created by `run_job` | `train` on the `gpu` pool (toleration + `nvidia.com/gpu: 1`), `predict` and `promote` on `cpu`; `ttlSecondsAfterFinished: 3600` |
 
 ### Temporal
 
@@ -230,5 +276,11 @@ temporal workflow list --address 127.0.0.1:7233
 | Kubernetes node image | `v1.35.0` | default image of kind v0.31, pinned by digest |
 | `temporalio/temporal` chart | `1.7.0` | server 1.32.0, UI 2.54.1 |
 | Postgres | `17.11-alpine` | |
+| ClickHouse | `26.8.25.14` | LTS |
+| SeaweedFS | `4.48` | MinIO was archived in 2026 |
+| MLflow | `3.17.0` (`-full` image) | `psycopg2` and `boto3` included |
+| golang-migrate | `v4.20.1` | |
+| Temporal SDKs | Python `temporalio` 1.34, Rust `temporalio-client` 1.1 | |
+| PyTorch | 2.14 (CPU wheels) | |
 | `hashicorp/helm` provider | `~> 3.3` | |
 | `hashicorp/kubernetes` provider | `~> 3.3` | |

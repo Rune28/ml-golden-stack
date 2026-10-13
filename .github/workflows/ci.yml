@@ -1,0 +1,116 @@
+# Tests on every pull request and push; images on every push, published to
+# GHCR only from main. Deploying to the local kind cluster is not CI's job:
+# `make platform-up IMAGES=remote TAG=sha-<commit>` takes these images.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: test ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [de_worker, mle_models]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # no moving major tag in this repo
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.project }}/uv.lock
+      - run: uv sync --frozen
+      - run: uv run pytest
+
+  rust:
+    name: test be_service
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: be_service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: be_service
+      # The Temporal SDK compiles protobuf definitions at build time.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  infra:
+    name: lint infra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: opentofu/setup-opentofu@v2
+      - run: tofu fmt -recursive -check infra
+      - name: tofu validate
+        run: |
+          for dir in infra/clusters/kind infra/envs/local; do
+            tofu -chdir=$dir init -backend=false -input=false
+            tofu -chdir=$dir validate
+          done
+      - uses: azure/setup-helm@v5
+      - run: helm lint infra/charts/*
+
+  images:
+    name: image ${{ matrix.image }}
+    needs: [python, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: be-service
+            context: be_service
+          - image: de-worker
+            context: de_worker
+          - image: mle-models
+            context: mle_models
+    env:
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

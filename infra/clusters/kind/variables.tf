@@ -79,9 +79,11 @@ variable "port_mappings" {
   }))
 
   default = {
-    temporal-ui   = { node_port = 30080, host_port = 8080 }
-    mlflow        = { node_port = 30500, host_port = 5000 }
-    minio-console = { node_port = 30901, host_port = 9001 }
+    temporal-ui = { node_port = 30080, host_port = 8080 }
+    mlflow      = { node_port = 30500, host_port = 5000 }
+    # The pipeline page (be_service). Sorts before mlflow, as minio-console
+    # did, so renaming it left the kind config unchanged.
+    app = { node_port = 30901, host_port = 9001 }
   }
 
   validation {

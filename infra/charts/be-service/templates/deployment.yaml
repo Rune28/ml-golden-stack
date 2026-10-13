@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "be-service.labels" . | nindent 4 }}
+spec:
+  # One replica: Add data is serialized by an in-process lock (see BACKLOG).
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {{- include "be-service.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "be-service.labels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: be-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:{{ .Values.service.port }}"
+            {{- range $name, $value := .Values.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretName }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+          resources: {{- toYaml .Values.resources | nindent 12 }}

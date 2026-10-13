@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MNIST pipeline</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #5d6673; --line: #e3e6ea;
+    --accent: #2f6fde; --accent-text: #ffffff; --ok: #1f8a4c; --warn: #b26b00; --bad: #c4362c; --bar: #2f6fde;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1e24; --text: #e6e9ed; --muted: #98a2ae; --line: #2a3038;
+      --accent: #5b8ff0; --accent-text: #0b0e12; --ok: #4cc27f; --warn: #e3a440; --bad: #ef6b61; --bar: #5b8ff0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+  .step { display: flex; flex-direction: column; gap: 10px; }
+  .step p { margin: 0; color: var(--muted); font-size: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { background: var(--accent); color: var(--accent-text); border: 0; border-radius: 7px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  select { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; font: inherit; }
+  .status { font-size: 13px; color: var(--muted); min-height: 1.4em; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid currentColor; }
+  .Running { color: var(--warn); } .Completed { color: var(--ok); } .Failed, .TimedOut, .Terminated, .Canceled { color: var(--bad); }
+  .spin { display: inline-block; width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: s 0.8s linear infinite; vertical-align: -1px; margin-right: 4px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .big { font-size: 28px; font-weight: 700; }
+  .kpis { display: flex; gap: 28px; flex-wrap: wrap; }
+  .kpi span { display: block; color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  .bar { position: relative; height: 8px; background: var(--line); border-radius: 4px; min-width: 80px; }
+  .bar i { position: absolute; inset: 0 auto 0 0; background: var(--bar); border-radius: 4px; }
+  .badge { font-size: 11px; font-weight: 700; color: var(--ok); border: 1px solid var(--ok); border-radius: 4px; padding: 0 5px; margin-left: 6px; }
+  .digits { display: grid; grid-template-columns: 22px 1fr 54px; gap: 6px 10px; align-items: center; font-size: 14px; }
+  .empty { color: var(--muted); font-size: 14px; }
+  .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .tabs button { background: transparent; color: var(--muted); border: 1px solid var(--line); padding: 4px 10px; font-weight: 600; }
+  .tabs button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 10px; }
+  .tile { text-align: center; font-size: 12px; color: var(--muted); }
+  .tile canvas { width: 72px; height: 72px; image-rendering: pixelated; border-radius: 6px; display: block; margin: 0 auto 4px; border: 2px solid var(--ok); }
+  .tile.wrong canvas { border-color: var(--bad); }
+  .tile b { color: var(--text); font-size: 14px; }
+  .tile.wrong b { color: var(--bad); }
+  table.cm { width: auto; border-collapse: separate; border-spacing: 2px; font-size: 12px; }
+  table.cm td, table.cm th { border: 0; padding: 0; width: 34px; height: 28px; text-align: center; }
+  table.cm td { border-radius: 4px; font-variant-numeric: tabular-nums; }
+  .legend { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  #toast { position: fixed; left: 16px; right: 16px; bottom: 16px; max-width: 520px; margin: 0 auto; background: var(--card); border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 10px 14px; display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MNIST pipeline</h1>
+  <p class="sub">Add data → train → run. be_service (Rust) → Temporal → de_worker (Python) → Kubernetes Jobs → ClickHouse, MLflow.</p>
+
+  <div class="grid">
+    <div class="card step">
+      <h2>1 · Add data</h2>
+      <p>The next MNIST training examples become one batch in ClickHouse.</p>
+      <div class="row">
+        <select id="count"><option>1000</option><option selected>5000</option><option>10000</option><option>20000</option></select>
+        <button id="add">Add data</button>
+      </div>
+      <div class="status" id="add-status"></div>
+    </div>
+    <div class="card step">
+      <h2>2 · Train model</h2>
+      <p>Trains on all data so far; promoted to champion if it beats the current one.</p>
+      <div class="row">
+        <select id="pool"><option value="gpu" selected>gpu pool</option><option value="cpu">cpu pool</option></select>
+        <button id="train">Train model</button>
+      </div>
+      <div class="status" id="train-status"></div>
+    </div>
+    <div class="card step">
+      <h2>3 · Run model</h2>
+      <p>The champion predicts all 10,000 test images; predictions go to ClickHouse.</p>
+      <div class="row"><button id="run">Run model</button></div>
+      <div class="status" id="run-status"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Data</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="big" id="train-n">–</div><span>training examples</span></div>
+        <div class="kpi"><div class="big" id="batches-n">–</div><span>batches</span></div>
+        <div class="kpi"><div class="big" id="test-n">–</div><span>test examples</span></div>
+      </div>
+      <div class="scroll" style="margin-top:12px"><table id="batches"></table></div>
+    </div>
+    <div class="card">
+      <h2>Models (MLflow · mnist-cnn)</h2>
+      <div class="scroll"><table id="models"></table></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Prediction runs</h2>
+      <div class="scroll"><table id="predictions"></table></div>
+    </div>
+    <div class="card">
+      <h2>Accuracy per digit · latest run</h2>
+      <div id="digits"></div>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>What the model sees · latest run</h2>
+      <div class="tabs"><button id="tab-mistakes" class="on">Mistakes</button><button id="tab-sample">Random sample</button></div>
+      <div class="tiles" id="tiles"><div class="empty">Appears after the first run.</div></div>
+      <p class="legend">Each tile is a 28×28 test image from ClickHouse. Big digit: the model's answer; below: the true digit and how sure the model was. Mistakes are sorted by confidence: the model was most sure exactly where it was wrong.</p>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Confusion matrix · latest run</h2>
+      <div class="scroll"><table class="cm" id="confusion"></table></div>
+      <p class="legend">Rows: true digit, columns: the model's answer. The diagonal is right; every other cell counts one kind of mistake, darker is more.</p>
+    </div>
+  </div>
+  <div class="err" id="errors"></div>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (x) => x == null ? "–" : (100 * x).toFixed(2) + "%";
+const n = (x) => x == null ? "–" : x.toLocaleString("en-US");
+const time = (s) => s ? new Date(s * 1000).toLocaleTimeString() : "";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const bar = (x) => `<div class="bar"><i style="width:${Math.max(0, Math.min(1, x || 0)) * 100}%"></i></div>`;
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => (t.style.display = "none"), 6000);
+}
+
+async function post(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+$("add").onclick = async () => {
+  $("add").disabled = true; $("add-status").innerHTML = '<span class="spin"></span>adding…';
+  try {
+    const r = await post("/api/batches", { count: Number($("count").value) });
+    $("add-status").textContent = `+${n(r.added)} examples (#${n(r.first_idx)}–${n(r.first_idx + r.added - 1)}), ${n(r.train_total)} in total`;
+  } catch (e) { $("add-status").textContent = ""; toast(e.message); }
+  $("add").disabled = false; refresh();
+};
+$("train").onclick = () => start("/api/train", { pool: $("pool").value }, "train");
+$("run").onclick = () => start("/api/run", {}, "run");
+
+async function start(path, body, id) {
+  $(id).disabled = true;
+  try { await post(path, body); } catch (e) { toast(e.message); }
+  refresh();
+}
+
+function workflow(id, wf, done) {
+  const running = wf && wf.status === "Running";
+  $(id).disabled = running;
+  if (!wf) { $(id + "-status").textContent = "not run yet"; return; }
+  const head = `<span class="pill ${wf.status}">${running ? '<span class="spin"></span>' : ""}${wf.status}</span> ${time(wf.started_at)}`;
+  const body = wf.error ? `<div class="err">${esc(wf.error)}</div>` : wf.result ? " · " + done(wf.result) : "";
+  $(id + "-status").innerHTML = head + body;
+}
+
+function render(s) {
+  if (s.stats) { $("train-n").textContent = n(s.stats.train); $("test-n").textContent = n(s.stats.test); $("batches-n").textContent = n(s.stats.train_batches); }
+  const b = s.batches || [];
+  $("batches").innerHTML = b.length ? "<tr><th>batch_id</th><th>examples</th><th>idx</th><th>added</th></tr>" +
+    b.slice(-6).reverse().map((x) => `<tr><td>${esc(x.batch_id.slice(0, 13))}…</td><td class="num">${n(x.rows)}</td><td class="num">${n(x.first_idx)}–${n(x.last_idx)}</td><td>${time(x.added_at)}</td></tr>`).join("")
+    : '<tr><td class="empty">No data yet: start with Add data.</td></tr>';
+
+  workflow("train", s.workflows && s.workflows.train, (r) => `v${r.version}, ${pct(r.accuracy)} on ${n(r.train_samples)} examples` + (r.promoted ? ", promoted to champion" : ", champion kept"));
+  workflow("run", s.workflows && s.workflows.run, (r) => `v${r.model_version}: ${pct(r.accuracy)} on ${n(r.rows)} images`);
+
+  const m = s.models || [];
+  $("models").innerHTML = m.length ? "<tr><th>version</th><th>trained on</th><th>test accuracy</th><th></th></tr>" +
+    m.map((v) => `<tr><td>v${v.version}${v.champion ? '<span class="badge">champion</span>' : ""}</td><td class="num">${n(v.train_samples)}</td><td class="num">${pct(v.accuracy)}</td><td style="width:40%">${bar(v.accuracy)}</td></tr>`).join("")
+    : '<tr><td class="empty">No models yet: Train model.</td></tr>';
+
+  const p = s.predictions || [];
+  $("predictions").innerHTML = p.length ? "<tr><th>run</th><th>model</th><th>images</th><th>accuracy</th><th>at</th></tr>" +
+    p.map((r) => `<tr><td>${esc(r.run_id.slice(0, 13))}…</td><td>v${esc(r.model_version)}</td><td class="num">${n(r.rows)}</td><td class="num">${pct(r.accuracy)}</td><td>${time(r.predicted_at)}</td></tr>`).join("")
+    : '<tr><td class="empty">No predictions yet: Run model.</td></tr>';
+
+  const d = s.digits || [];
+  $("digits").innerHTML = d.length ? '<div class="digits">' + d.map((x) => `<b>${x.digit}</b>${bar(x.accuracy)}<span class="num">${pct(x.accuracy)}</span>`).join("") + "</div>"
+    : '<div class="empty">Appears after the first run.</div>';
+
+  $("errors").textContent = (s.errors || []).join(" · ");
+  if (p.length) showRun(p[0].run_id);
+}
+
+// Images and the confusion matrix of the latest prediction run: fetched when
+// that run changes, not on every poll.
+let shownRun = null, mistakes = true;
+
+function draw(canvas, b64) {
+  const px = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  canvas.width = 28; canvas.height = 28;
+  const ctx = canvas.getContext("2d"), img = ctx.createImageData(28, 28);
+  for (let i = 0; i < 784; i++) { img.data.set([px[i], px[i], px[i], 255], i * 4); }
+  ctx.putImageData(img, 0, 0);
+}
+
+async function loadExamples(runId) {
+  const list = await (await fetch(`/api/runs/${encodeURIComponent(runId)}/examples?mistakes=${mistakes}&limit=36`)).json();
+  const tiles = $("tiles");
+  tiles.innerHTML = list.length ? "" : '<div class="empty">No mistakes in this run.</div>';
+  for (const e of list) {
+    const wrong = e.label !== e.predicted;
+    const div = document.createElement("div");
+    div.className = "tile" + (wrong ? " wrong" : "");
+    div.innerHTML = `<canvas></canvas><b>${e.predicted}</b> · ${(100 * e.confidence).toFixed(0)}%<br>true ${e.label}`;
+    draw(div.querySelector("canvas"), e.pixels);
+    tiles.appendChild(div);
+  }
+}
+
+async function loadConfusion(runId) {
+  const cells = await (await fetch(`/api/runs/${encodeURIComponent(runId)}/confusion`)).json();
+  const m = Array.from({ length: 10 }, () => Array(10).fill(0));
+  for (const c of cells) m[c.label][c.predicted] = c.rows;
+  const maxOff = Math.max(1, ...cells.filter((c) => c.label !== c.predicted).map((c) => c.rows));
+  let html = "<tr><th></th>" + [...Array(10).keys()].map((d) => `<th>${d}</th>`).join("") + "</tr>";
+  for (let t = 0; t < 10; t++) {
+    html += `<tr><th>${t}</th>`;
+    for (let p = 0; p < 10; p++) {
+      const v = m[t][p];
+      const style = t === p
+        ? "background: color-mix(in srgb, var(--ok) 28%, transparent)"
+        : v ? `background: color-mix(in srgb, var(--bad) ${Math.round(15 + 85 * v / maxOff)}%, transparent)` : "";
+      html += `<td style="${style}" title="true ${t}, answered ${p}: ${v}">${v || ""}</td>`;
+    }
+    html += "</tr>";
+  }
+  $("confusion").innerHTML = html;
+}
+
+function showRun(runId, force) {
+  if (!runId || (runId === shownRun && !force)) return;
+  shownRun = runId;
+  loadExamples(runId).catch(() => {});
+  loadConfusion(runId).catch(() => {});
+}
+
+for (const [id, value] of [["tab-mistakes", true], ["tab-sample", false]]) {
+  $(id).onclick = () => {
+    mistakes = value;
+    $("tab-mistakes").classList.toggle("on", value); $("tab-sample").classList.toggle("on", !value);
+    if (shownRun) loadExamples(shownRun).catch(() => {});
+  };
+}
+
+async function refresh() {
+  try { render(await (await fetch("/api/state")).json()); } catch (e) { $("errors").textContent = "be_service unavailable"; }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
