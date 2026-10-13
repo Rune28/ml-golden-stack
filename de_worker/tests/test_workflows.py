@@ -5,8 +5,8 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from workflow import RunWorkflow, TrainWorkflow
-from workflow.contracts import JobRequest, RunInput, TrainInput
+from workflow import ReportWorkflow, RunWorkflow, TrainWorkflow
+from workflow.contracts import JobRequest, ReportInput, RunInput, TrainInput
 
 
 class FakeJobs:
@@ -22,6 +22,10 @@ class FakeJobs:
             return {"version": "7", "accuracy": self.accuracy, "train_samples": 5000, "champion": self.champion}
         if req.step == "promote":
             return {"champion": req.args[-1]}
+        if req.step == "report":
+            digits = [{"digit": d, "recognized": 1000, "actual": 1000} for d in range(10)]
+            return {"run_id": req.run_id, "prediction_run_id": req.args[-1], "model_version": "7", "total": 10000,
+                    "digits": digits, "most_over": {"digit": 8, "bias": 20}, "most_under": {"digit": 3, "bias": -15}}
         return {"model_version": "7", "accuracy": 0.95, "rows": 10000}
 
 
@@ -33,7 +37,7 @@ async def env():
 
 async def execute(env, jobs: FakeJobs, workflow, arg):
     queue = str(uuid.uuid4())
-    async with Worker(env.client, task_queue=queue, workflows=[TrainWorkflow, RunWorkflow], activities=[jobs.run_job]):
+    async with Worker(env.client, task_queue=queue, workflows=[TrainWorkflow, RunWorkflow, ReportWorkflow], activities=[jobs.run_job]):
         return await env.client.execute_workflow(workflow, arg, id=str(uuid.uuid4()), task_queue=queue)
 
 
@@ -76,3 +80,15 @@ async def test_run_without_run_id_gets_one(env):
     assert uuid.UUID(result.run_id)
     assert (result.model_version, result.rows) == ("7", 10000)
     assert jobs.requests[0].args == ["--run-id", result.run_id, "--model", "champion"]
+
+
+async def test_report_runs_one_cpu_job_on_the_given_prediction_run(env):
+    jobs = FakeJobs(0.9, None)
+
+    result = await execute(env, jobs, ReportWorkflow.run, ReportInput(prediction_run_id="pred-1", run_id="rep-1"))
+
+    [req] = jobs.requests
+    assert (req.step, req.pool, req.run_id) == ("report", "cpu", "rep-1")
+    assert req.args == ["--run-id", "rep-1", "--prediction-run-id", "pred-1"]
+    assert (result.prediction_run_id, result.most_over["digit"], len(result.digits)) == ("pred-1", 8, 10)
+

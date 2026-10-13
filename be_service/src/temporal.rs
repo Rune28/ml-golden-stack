@@ -26,6 +26,7 @@ pub const TASK_QUEUE: &str = "de";
 pub enum Pipeline {
     Train,
     Run,
+    Report,
 }
 
 impl Pipeline {
@@ -33,6 +34,7 @@ impl Pipeline {
         match self {
             Pipeline::Train => "Train",
             Pipeline::Run => "Run",
+            Pipeline::Report => "Report",
         }
     }
 
@@ -40,6 +42,7 @@ impl Pipeline {
         match self {
             Pipeline::Train => "train",
             Pipeline::Run => "run",
+            Pipeline::Report => "report",
         }
     }
 }

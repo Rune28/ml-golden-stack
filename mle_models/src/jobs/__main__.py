@@ -35,6 +35,11 @@ def main() -> None:
     p.add_argument("--model", default="champion", help="model version or alias")
     p.set_defaults(run=lambda a: steps.predict_step(a.run_id, a.model))
 
+    p = sub.add_parser("report", help="distribution of recognized digits in a prediction run")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--prediction-run-id", required=True)
+    p.set_defaults(run=lambda a: steps.report_step(a.run_id, a.prediction_run_id))
+
     p = sub.add_parser("promote", help="move the champion alias to a version")
     p.add_argument("--version", required=True)
     p.set_defaults(run=lambda a: steps.promote_step(a.version))

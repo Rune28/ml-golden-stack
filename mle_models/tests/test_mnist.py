@@ -64,3 +64,18 @@ def test_same_seed_same_model():
     b = train(images, labels, config)
 
     assert all(torch.equal(p, q) for p, q in zip(a.state_dict().values(), b.state_dict().values()))
+
+
+def test_digit_report_counts_recognized_and_actual_digits():
+    from mnist.report import digit_report, most_biased
+
+    labels = np.array([3, 3, 3, 8, 8, 1], dtype=np.uint8)
+    predicted = np.array([3, 8, 8, 8, 8, 1], dtype=np.uint8)  # two 3s read as 8
+
+    rows = digit_report(predicted, labels)
+
+    assert len(rows) == 10 and rows[5].recognized == rows[5].actual == 0
+    assert (rows[3].recognized, rows[3].actual) == (1, 3)
+    assert (rows[8].recognized, rows[8].actual) == (4, 2)
+    over, under = most_biased(rows)
+    assert (over.digit, over.bias, under.digit, under.bias) == (8, 2, 3, -2)

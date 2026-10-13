@@ -61,6 +61,14 @@ pub struct ConfusionCell {
     pub rows: u64,
 }
 
+/// One digit of a report: how often the model answered it, how often it was there.
+#[derive(Serialize, Deserialize, Row, Debug)]
+pub struct DigitCount {
+    pub digit: u8,
+    pub recognized: u32,
+    pub actual: u32,
+}
+
 #[derive(Serialize, Deserialize, Row, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub train: u64,
@@ -172,6 +180,16 @@ impl ClickHouse {
                  GROUP BY label, predicted ORDER BY label, predicted",
             )
             .bind(run_id)
+            .fetch_all()
+            .await?)
+    }
+
+    /// The report on a prediction run, empty until the Report step ran on it.
+    pub async fn digit_report(&self, prediction_run_id: &str) -> Result<Vec<DigitCount>> {
+        Ok(self
+            .client
+            .query("SELECT digit, recognized, actual FROM digit_report WHERE prediction_run_id = ? ORDER BY digit")
+            .bind(prediction_run_id)
             .fetch_all()
             .await?)
     }

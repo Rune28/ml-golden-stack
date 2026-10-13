@@ -48,6 +48,11 @@
   .digits { display: grid; grid-template-columns: 22px 1fr 54px; gap: 6px 10px; align-items: center; font-size: 14px; }
   .empty { color: var(--muted); font-size: 14px; }
   .err { color: var(--bad); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+  .hist { display: grid; grid-template-columns: 22px 1fr 150px; gap: 8px 10px; align-items: center; font-size: 14px; }
+  .hbar { position: relative; height: 18px; background: var(--line); border-radius: 4px; }
+  .hbar i { position: absolute; inset: 0 auto 0 0; background: var(--bar); border-radius: 4px; }
+  .hbar s { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+  .over { color: var(--bad); } .under { color: var(--warn); }
   .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
   .tabs button { background: transparent; color: var(--muted); border: 1px solid var(--line); padding: 4px 10px; font-weight: 600; }
   .tabs button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
@@ -93,6 +98,20 @@
       <p>The champion predicts all 10,000 test images; predictions go to ClickHouse.</p>
       <div class="row"><button id="run">Run model</button></div>
       <div class="status" id="run-status"></div>
+    </div>
+    <div class="card step">
+      <h2>4 · Report</h2>
+      <p>What the recognized digits add up to: how many of each the model saw, next to how many there are.</p>
+      <div class="row"><button id="report">Report</button></div>
+      <div class="status" id="report-status"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Recognized digits · latest report</h2>
+      <div id="report-chart"><div class="empty">Appears after Report.</div></div>
+      <p class="legend">Bars: how many images the model recognized as each digit; the line marks how many there really are. A bar past its line is a digit the model sees too often, short of it one it misses.</p>
     </div>
   </div>
 
@@ -171,6 +190,22 @@ $("add").onclick = async () => {
 };
 $("train").onclick = () => start("/api/train", { pool: $("pool").value }, "train");
 $("run").onclick = () => start("/api/run", {}, "run");
+$("report").onclick = () => start("/api/report", {}, "report");
+
+function reportChart(r) {
+  const max = Math.max(1, ...r.digits.map((d) => Math.max(d.recognized, d.actual)));
+  const rows = r.digits.map((d) => {
+    const bias = d.recognized - d.actual;
+    const cls = bias > 0 ? "over" : bias < 0 ? "under" : "";
+    const sign = bias > 0 ? "+" : "";
+    return `<b>${d.digit}</b><div class="hbar"><i style="width:${100 * d.recognized / max}%"></i><s style="left:${100 * d.actual / max}%"></s></div>` +
+      `<span class="num">${n(d.recognized)} <span class="${cls}">(${sign}${n(bias)})</span></span>`;
+  }).join("");
+  $("report-chart").innerHTML =
+    `<p class="legend" style="margin:0 0 10px">Prediction run ${esc(r.prediction_run_id.slice(0, 13))}…, model v${esc(r.model_version)}, ${n(r.total)} images. ` +
+    `Seen too often: <b class="over">${r.most_over.digit}</b> (+${n(r.most_over.bias)}), missed most: <b class="under">${r.most_under.digit}</b> (${n(r.most_under.bias)}).</p>` +
+    `<div class="hist">${rows}</div>`;
+}
 
 async function start(path, body, id) {
   $(id).disabled = true;
@@ -196,6 +231,9 @@ function render(s) {
 
   workflow("train", s.workflows && s.workflows.train, (r) => `v${r.version}, ${pct(r.accuracy)} on ${n(r.train_samples)} examples` + (r.promoted ? ", promoted to champion" : ", champion kept"));
   workflow("run", s.workflows && s.workflows.run, (r) => `v${r.model_version}: ${pct(r.accuracy)} on ${n(r.rows)} images`);
+  const rep = s.workflows && s.workflows.report;
+  workflow("report", rep, (r) => `${n(r.total)} images, digit ${r.most_over.digit} seen most often in excess`);
+  if (rep && rep.result) reportChart(rep.result);
 
   const m = s.models || [];
   $("models").innerHTML = m.length ? "<tr><th>version</th><th>trained on</th><th>test accuracy</th><th></th></tr>" +

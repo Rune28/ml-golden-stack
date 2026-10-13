@@ -16,7 +16,7 @@ MODEL ?= champion
 
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run \
+        images images-load app-status add-data train run report \
         preflight host-setup test fmt validate
 
 help:
@@ -36,6 +36,7 @@ help:
 	@echo "add-data N=5000  add the next N MNIST examples (be_service)"
 	@echo "train POOL=gpu   start the Train workflow"
 	@echo "run MODEL=champion  start the Run workflow"
+	@echo "report           start the Report workflow on the latest prediction run"
 	@echo "test             unit tests of be_service, de_worker and mle_models"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
@@ -122,6 +123,10 @@ run:
 	$(KUBECTL) -n temporal exec deploy/temporal-admintools -- temporal workflow start \
 	  --address temporal-frontend:7233 --task-queue de --type Run --workflow-id run \
 	  --input '{"model": "$(MODEL)"}'
+
+# Through be_service: it picks the latest prediction run.
+report:
+	@curl -sS -H 'content-type: application/json' -d '{}' http://127.0.0.1:9001/api/report; echo
 
 test:
 	cd be_service && cargo test

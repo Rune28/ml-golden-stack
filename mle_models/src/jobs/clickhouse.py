@@ -79,3 +79,35 @@ def write_predictions(
             column_names=["run_id", "model_version", "idx", "label", "predicted", "confidence"],
             column_oriented=True,
         )
+
+
+def read_predictions(client, run_id: str) -> tuple[str, np.ndarray, np.ndarray]:
+    """Model version, predicted digits and true digits of one prediction run."""
+    result = client.query(
+        "SELECT any(model_version), groupArray(predicted), groupArray(label) FROM predictions WHERE run_id = {r:String}",
+        parameters={"r": run_id},
+    ).result_rows[0]
+    version, predicted, labels = result
+    if not predicted:
+        raise ValueError(f"no predictions for run {run_id}")
+    return version, np.asarray(predicted, dtype=np.uint8), np.asarray(labels, dtype=np.uint8)
+
+
+def write_digit_report(client, prediction_run_id: str, report_run_id: str, model_version: str, rows) -> None:
+    """Idempotent: a retry of the same report keeps its rows; a new report on
+    the same prediction run replaces the previous one."""
+    done = client.query(
+        "SELECT count() FROM digit_report WHERE prediction_run_id = {p:String} AND report_run_id = {r:String}",
+        parameters={"p": prediction_run_id, "r": report_run_id},
+    ).result_rows[0][0]
+    if done == len(rows):
+        return
+    client.command(
+        "DELETE FROM digit_report WHERE prediction_run_id = {p:String}", parameters={"p": prediction_run_id}
+    )
+    client.insert(
+        "digit_report",
+        [[prediction_run_id, report_run_id, model_version, r.digit, r.recognized, r.actual] for r in rows],
+        column_names=["prediction_run_id", "report_run_id", "model_version", "digit", "recognized", "actual"],
+    )
+

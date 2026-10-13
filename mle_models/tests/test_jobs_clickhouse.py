@@ -62,3 +62,33 @@ def test_write_predictions_is_idempotent_per_run(existing, deleted, inserted):
     write_predictions(client, "run-1", "3", *predictions())
 
     assert (client.deleted, client.inserted, client.rows) == (deleted, inserted, 12)
+
+
+class FakeReportClient:
+    def __init__(self, done=0):
+        self.done, self.deleted, self.inserted = done, False, []
+
+    def query(self, sql, parameters):
+        return type("Result", (), {"result_rows": [[self.done]]})
+
+    def command(self, sql, parameters):
+        self.deleted = True
+
+    def insert(self, table, rows, column_names):
+        self.inserted = rows
+
+
+def test_write_digit_report_skips_a_retry_and_replaces_an_old_report():
+    from jobs.clickhouse import write_digit_report
+    from mnist.report import digit_report
+
+    rows = digit_report(np.arange(10, dtype=np.uint8), np.arange(10, dtype=np.uint8))
+
+    retry = FakeReportClient(done=10)
+    write_digit_report(retry, "pred-1", "report-1", "3", rows)
+    assert not retry.deleted and retry.inserted == []
+
+    fresh = FakeReportClient(done=0)
+    write_digit_report(fresh, "pred-1", "report-2", "3", rows)
+    assert fresh.deleted and len(fresh.inserted) == 10
+    assert fresh.inserted[3] == ["pred-1", "report-2", "3", 3, 1, 1]

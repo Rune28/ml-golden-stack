@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::ingest::{self, IngestError, IngestResult, TEST_BATCH_ID};
 use crate::mlflow::{Mlflow, ModelVersion};
 use crate::mnist::{Source, SplitKind};
-use crate::store::{Batch, ClickHouse, ConfusionCell, DigitAccuracy, PredictionRun, Stats};
+use crate::store::{Batch, ClickHouse, ConfusionCell, DigitAccuracy, DigitCount, PredictionRun, Stats};
 use crate::temporal::{Pipeline, StartError, Started, Status, Temporal};
 
 /// Upper bound of one Add data: the whole MNIST train split.
@@ -36,10 +36,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/batches", post(add_data))
         .route("/api/train", post(train))
         .route("/api/run", post(run))
+        .route("/api/report", post(report))
         .route("/api/stats", get(stats))
         .route("/api/state", get(page_state))
         .route("/api/runs/{run_id}/examples", get(examples))
         .route("/api/runs/{run_id}/confusion", get(confusion))
+        .route("/api/runs/{run_id}/report", get(digit_report))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -123,6 +125,26 @@ async fn run(State(state): State<Arc<AppState>>, Json(req): Json<RunRequest>) ->
     start(&state, Pipeline::Run, input).await
 }
 
+#[derive(Deserialize, Default)]
+struct ReportRequest {
+    /// The prediction run to report on; the latest one when absent.
+    prediction_run_id: Option<String>,
+}
+
+/// Starts the Report workflow: the distribution of the digits a prediction
+/// run recognized, next to the true one.
+async fn report(State(state): State<Arc<AppState>>, Json(req): Json<ReportRequest>) -> Result<Json<Started>, ApiError> {
+    let prediction_run_id = match req.prediction_run_id {
+        Some(id) => validate_run_id("prediction_run_id", id)?,
+        None => match state.store.prediction_runs(1).await?.into_iter().next() {
+            Some(latest) => latest.run_id,
+            None => return Err(ApiError::Conflict("nothing to report on: Run model first".into())),
+        },
+    };
+    let input = json!({ "run_id": uuid::Uuid::now_v7().to_string(), "prediction_run_id": prediction_run_id });
+    start(&state, Pipeline::Report, input).await
+}
+
 async fn start(state: &AppState, pipeline: Pipeline, input: Value) -> Result<Json<Started>, ApiError> {
     match state.temporal.start(pipeline, input).await {
         Ok(started) => {
@@ -178,6 +200,13 @@ async fn examples(
     ))
 }
 
+async fn digit_report(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Vec<DigitCount>>, ApiError> {
+    Ok(Json(state.store.digit_report(&run_id).await?))
+}
+
 async fn confusion(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
@@ -210,13 +239,14 @@ fn part<T>(errors: &mut Vec<String>, name: &str, result: anyhow::Result<T>) -> O
 
 async fn page_state(State(state): State<Arc<AppState>>) -> Json<PageState> {
     let mut errors = Vec::new();
-    let (stats, batches, models, predictions, train, run) = tokio::join!(
+    let (stats, batches, models, predictions, train, run, report) = tokio::join!(
         state.store.stats(),
         state.store.batches(),
         state.mlflow.versions(),
         state.store.prediction_runs(10),
         state.temporal.status(Pipeline::Train),
         state.temporal.status(Pipeline::Run),
+        state.temporal.status(Pipeline::Report),
     );
     let stats = part(&mut errors, "data", stats);
     let batches = part(&mut errors, "data", batches);
@@ -224,6 +254,7 @@ async fn page_state(State(state): State<Arc<AppState>>) -> Json<PageState> {
     let predictions = part(&mut errors, "predictions", predictions);
     let train: Option<Option<Status>> = part(&mut errors, "temporal", train);
     let run: Option<Option<Status>> = part(&mut errors, "temporal", run);
+    let report: Option<Option<Status>> = part(&mut errors, "temporal", report);
 
     let latest = predictions.as_ref().and_then(|p| p.first()).map(|p| p.run_id.clone());
     let digits = match latest {
@@ -235,7 +266,7 @@ async fn page_state(State(state): State<Arc<AppState>>) -> Json<PageState> {
     Json(PageState {
         stats,
         batches,
-        workflows: json!({ "train": train.flatten(), "run": run.flatten() }),
+        workflows: json!({ "train": train.flatten(), "run": run.flatten(), "report": report.flatten() }),
         models,
         predictions,
         digits,
@@ -250,6 +281,16 @@ fn validate_batch_id(id: String) -> Result<String, ApiError> {
         return Err(ApiError::BadRequest(
             "batch_id: 1-64 letters, digits, '-' or '_', and not the reserved test batch id".into(),
         ));
+    }
+    Ok(id)
+}
+
+/// A run id sent by a client: 1-64 letters, digits, '-' or '_'.
+fn validate_run_id(field: &str, id: String) -> Result<String, ApiError> {
+    let well_formed =
+        (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !well_formed {
+        return Err(ApiError::BadRequest(format!("{field}: 1-64 letters, digits, '-' or '_'")));
     }
     Ok(id)
 }
