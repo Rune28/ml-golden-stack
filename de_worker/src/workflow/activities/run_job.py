@@ -12,6 +12,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -79,7 +80,9 @@ class JobRunner:
     @activity.defn(name="run_job")
     def run_job(self, req: JobRequest) -> dict:
         name = job_name(req.step, req.run_id)
-        self._create(name, req)
+        # When the workflow scheduled the step, not when this attempt began:
+        # the logical start of the run in the run registry, same on retries.
+        self._create(name, req, activity.info().scheduled_time)
         try:
             self._wait(name)
         except CancelledError:
@@ -88,7 +91,7 @@ class JobRunner:
             raise
         return self._result(req)
 
-    def manifest(self, name: str, req: JobRequest) -> k8s.V1Job:
+    def manifest(self, name: str, req: JobRequest, started_at: datetime) -> k8s.V1Job:
         cfg = self.config
         labels = {**cfg.labels, "pipeline/step": req.step, "pipeline/run-id": job_name("", req.run_id)}
         requests = {"cpu": req.cpu, "memory": req.memory}
@@ -105,7 +108,14 @@ class JobRunner:
             name="step",
             image=cfg.image,
             image_pull_policy="IfNotPresent",
-            args=["--result-key", result_key(req.step, req.run_id), req.step, *req.args],
+            args=[
+                "--result-key",
+                result_key(req.step, req.run_id),
+                "--started-at",
+                started_at.isoformat(),
+                req.step,
+                *req.args,
+            ],
             env=[k8s.V1EnvVar(name="TORCH_THREADS", value=req.cpu)],
             env_from=[
                 k8s.V1EnvFromSource(config_map_ref=k8s.V1ConfigMapEnvSource(name=cfg.env_config_map)),
@@ -133,9 +143,9 @@ class JobRunner:
             ),
         )
 
-    def _create(self, name: str, req: JobRequest) -> None:
+    def _create(self, name: str, req: JobRequest, started_at: datetime) -> None:
         try:
-            self.batch.create_namespaced_job(self.config.namespace, self.manifest(name, req))
+            self.batch.create_namespaced_job(self.config.namespace, self.manifest(name, req, started_at))
             activity.logger.info("created job %s", name)
         except ApiException as e:
             if e.status != 409:

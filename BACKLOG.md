@@ -24,6 +24,8 @@ Postgres is a single instance (`modules/postgres-local`, one replica on one node
 - [ ] `run_job` creates Jobs with the label `kueue.x-k8s.io/queue-name` and `suspend: true`, without its own nodeSelector and tolerations: the flavor sets them
 - [ ] Priorities: `run` (inference) above `train`
 - [ ] Check: two train workflows started together, the second Job waits admitted-but-suspended in the queue, not `Pending` on the scheduler
+- [ ] Time in the queue is separate from run time. Today `start_to_close = deadline + 120 s` counts from the activity start, while a suspended Job does not run its `activeDeadlineSeconds`: three attempts time out and the workflow fails with the Job still queued. Waiting for admission gets its own timeout (a separate activity or a workflow timer), `start_to_close` covers only the running Job
+- [ ] Check: a train Job waits in the queue longer than its deadline, the workflow still finishes
 
 ### Highly available ClickHouse and SeaweedFS
 
@@ -47,6 +49,54 @@ A first version was written and never run end to end, then removed. It is in com
 - [ ] NVIDIA device plugin installed in `envs/local` in `nvidia` mode; GPU nodes labelled `nvidia.com/gpu.present=true`
 - [ ] End-to-end check: a pod requesting `nvidia.com/gpu: 1` on the `gpu` pool runs `nvidia-smi` and sees the host GPU
 - [ ] Model step manifests unchanged between `simulated` and `nvidia`
+
+## Pipeline correctness
+
+Retries are safe today in the common case (see the contracts in [README](README.md#pipeline)), but some guarantees hold only by accident: a time window, the fixed workflow ID, or "nobody deletes a batch".
+
+### Idempotency of pipeline steps
+
+- [ ] `run_job` reads `result.json` before creating the Job and returns it when present. Today idempotency lasts as long as the Job exists (`ttlSecondsAfterFinished: 3600`): an activity retried later (Temporal down for 2 hours) finds no Job, creates a new one and trains again. With the check, the window is the retention of the `pipeline` bucket
+- [ ] Test: Job deleted, `result.json` present → no new Job, the stored result is returned
+- [ ] `train` registers at most one model version per `run_id`. Today the version is registered in `log_model`, `result.json` is written later: a pod that dies in between is restarted by `backoffLimit: 1` and registers a second version. Look up an MLflow run tagged `pipeline_run_id` first and reuse its version
+- [ ] Add data: offset from `max(idx) + 1` of the train split (or an explicit range per batch), not from `count()`. Today a deleted batch, or a retry of a partial batch after another batch was added, makes `idx` ranges overlap and duplicates examples
+- [ ] Invariant written down next to `samples`: append-only, batches are never deleted outside the partial-batch rewrite
+
+### Promotion safety
+
+Promotion is correct only because the workflow ID `train` lets one Train run at a time. Two Trains with different IDs (a sweep, a second model) both read champion v3, both promote, and the last one wins even if it is worse.
+
+- [ ] `promote` is compare-and-set: the Job gets the champion version the workflow compared against and refuses when the alias has moved since
+- [ ] The workflow handles the refusal: compares against the new champion again or reports `promoted: false`
+- [ ] Check: two Train workflows with different IDs started together, the better model ends up `champion`
+
+### Lineage
+
+- [ ] Train reads a snapshot: first the list of `batch_id`s, then `samples WHERE batch_id IN (...)`, and the same list goes to `train_batches.json`. Today the samples and the batch list are two separate queries, and an Add data between them puts a batch into lineage that the model never saw
+- [ ] Test: Add data during training does not change `train_batches.json` of the running Train
+- [ ] Code version in MLflow: the `mle_models` image (tag and digest) as a run tag; de_worker passes `JOB_IMAGE` to the Job. Today "which code trained v7" has no answer
+- [ ] `predictions` inherits the source `batch_id` of each example (README, rule 5), so lineage from a prediction back to its batch is a join
+
+### Run registry
+
+`ml_data.runs` (README, rule 11) holds markers of `predict` and `report` runs, and be_service reads reports through `digit_report_latest`. The rest of the platform still reads tables directly.
+
+- [ ] be_service commits every batch (`kind = 'batch'`) after its insert; backfill markers for the batches already in `samples`
+- [ ] Train reads committed batches only: the batch list from `runs`, then `samples WHERE batch_id IN (...)`. This is also the snapshot from [Lineage](#lineage): `train_batches.json` is the same list
+- [ ] Views for every read of be_service (`stats`, `batches`, `prediction_runs`, `examples`, `confusion`, `digit_accuracy`) and of the Jobs (`read_split`, `read_predictions`), each over committed runs only
+- [ ] Grants enforce it: readers get `SELECT` on views only (with [a ClickHouse user per component](#access-and-security))
+- [ ] Cleanup of rows whose run was never committed (the step failed after writing): a scheduled job deletes rows of runs older than a day with no marker
+- [ ] `run_id` is checked at the entry (be_service, workflow input): a UUID made by the platform, since the registry assumes it unique across all kinds
+- [ ] Rollout note for 0006–0009: a report written by the previous image after the migration has no marker and stays hidden until reported again. On a long-lived cluster the view switch (0009) goes in the release after every writer commits
+
+### Contracts between be_service and de_worker
+
+- [ ] One schema source (JSON Schema) for workflow inputs and results. Today be_service sends untyped `json!` and a drift shows up only at run time
+- [ ] Contract test in CI on both sides: be_service payloads decode into the `contracts.py` dataclasses, workflow results decode in be_service
+
+### run_job at scale
+
+- [ ] Today one thread per running Job and a status poll every 2 s: fine for 8 Jobs, 500 requests/s to the API server for 1000. Watch Jobs instead of polling, or poll from the workflow with timers and short activities
 
 ## Infrastructure: long-lived cluster
 
@@ -123,6 +173,8 @@ Node drains during upgrades and spot interruptions must not take services down.
 - [ ] Topology spread constraints across availability zones
 - [ ] Readiness and liveness probes on every service
 - [ ] Resource requests and limits on every container
+- [ ] Pipeline Jobs on spot nodes (the `gpu` pool is `capacity-type=spot`): `podFailurePolicy` with `DisruptionTarget → Ignore`, so an eviction does not count against `backoffLimit`. Today two evictions in a row fail the Job, and `run_job` marks that non-retryable like a bug in the code
+- [ ] Long trainings checkpoint to the object store and resume after an eviction
 
 ### Helm charts and CRDs
 
@@ -147,6 +199,11 @@ Long-running workflows outlive worker deployments. Changed workflow code replayi
 - [ ] Temporal server upgrades run schema migrations (`temporal-sql-tool` or the chart's schema update job) before new server pods start
 - [ ] MLflow upgrades run `mlflow db upgrade` as a Job before the new server starts
 - [ ] Database snapshot taken before every migration
+- [ ] ClickHouse migrations follow expand/contract. Adding (a column with `DEFAULT` or `Nullable`): migration first, then code; `depends_on = [module.clickhouse_migrate]` already enforces this order. Removing or renaming: code first, migration in a later release; a rename takes three releases (add the new column, write both and read the new one, drop the old one)
+- [ ] A schema change stays compatible with the previous `mle_models` image for at least the longest Job deadline: Jobs started before the rollout keep running the old code
+- [ ] CI fails when an already applied migration file is changed. Today the hash in `clickhouse-migrate` gives a new Job name, the Job runs, `migrate` sees the version as applied and silently skips the edit
+- [ ] Runbook for a migration left `dirty` by golang-migrate (`migrate force <version>` after fixing the schema by hand)
+- [ ] Contract step of migration 0005 (`digit_report.report_run_id` → `run_id`, README rule 10), in a release after every running image writes `run_id`: three migrations, one statement each, `MATERIALIZE COLUMN run_id` (with `mutations_sync = 2`), `MODIFY COLUMN run_id REMOVE DEFAULT`, `DROP COLUMN report_run_id`; then `write_digit_report` stops writing `report_run_id`
 
 #### Kueue
 
@@ -164,7 +221,8 @@ On a long-lived cluster someone will run `kubectl edit` "for a minute".
 
 - [ ] No shared admin kubeconfig: access through IAM / SSO (EKS access entries) and RBAC roles
 - [ ] Authentication on be_service: OIDC login (or a session behind an auth proxy such as oauth2-proxy) before any button; Temporal, ClickHouse and MLflow are reachable only from inside the cluster, never through be_service as a proxy
-- [ ] be_service talks to ClickHouse as a read-only user; only mle_models Jobs have write grants
+- [ ] A ClickHouse user per component instead of the one `platform` user (access management, effectively admin) in every Secret: migrations get DDL; be_service gets `INSERT` and `DELETE` on `samples` and `SELECT`; mle_models Jobs get `SELECT` on `samples` and `INSERT`/`DELETE` on `predictions` and `digit_report`; de_worker gets none. Today any model step can `DROP DATABASE ml_data`
+- [ ] de_worker's own settings split from the Jobs' `pipeline-job` ConfigMap and Secret: the worker needs only S3 to read `result.json`, not ClickHouse
 - [ ] NetworkPolicy: deny by default between namespaces, explicit allows
 - [ ] Node images (AMI) updated on a schedule
 - [ ] Container images scanned in CI, builds fail on critical vulnerabilities

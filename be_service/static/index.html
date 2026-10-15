@@ -180,14 +180,30 @@ async function post(path, body) {
   return data;
 }
 
+// Size of the MNIST train split: once every example is in some batch, Add
+// data has nothing left to add (be_service answers 409).
+const MNIST_TRAIN = 60000;
+// Keeps the poll from enabling the button while a batch is being added.
+let adding = false;
+
 $("add").onclick = async () => {
-  $("add").disabled = true; $("add-status").innerHTML = '<span class="spin"></span>adding…';
+  adding = true; $("add").disabled = true; $("add-status").innerHTML = '<span class="spin"></span>adding…';
   try {
     const r = await post("/api/batches", { count: Number($("count").value) });
     $("add-status").textContent = `+${n(r.added)} examples (#${n(r.first_idx)}–${n(r.first_idx + r.added - 1)}), ${n(r.train_total)} in total`;
   } catch (e) { $("add-status").textContent = ""; toast(e.message); }
-  $("add").disabled = false; refresh();
+  adding = false; $("add").disabled = false; refresh();
 };
+
+function dataLeft(train) {
+  const full = train >= MNIST_TRAIN;
+  $("count").disabled = full;
+  $("add").textContent = full ? "All added" : "Add data";
+  if (adding) return;
+  $("add").disabled = full;
+  if (full) $("add-status").textContent = `All ${n(MNIST_TRAIN)} MNIST training examples are added. To start over: make platform-down && make platform-up.`;
+}
+
 $("train").onclick = () => start("/api/train", { pool: $("pool").value }, "train");
 $("run").onclick = () => start("/api/run", {}, "run");
 $("report").onclick = () => start("/api/report", {}, "report");
@@ -223,7 +239,10 @@ function workflow(id, wf, done) {
 }
 
 function render(s) {
-  if (s.stats) { $("train-n").textContent = n(s.stats.train); $("test-n").textContent = n(s.stats.test); $("batches-n").textContent = n(s.stats.train_batches); }
+  if (s.stats) {
+    $("train-n").textContent = n(s.stats.train); $("test-n").textContent = n(s.stats.test); $("batches-n").textContent = n(s.stats.train_batches);
+    dataLeft(s.stats.train);
+  }
   const b = s.batches || [];
   $("batches").innerHTML = b.length ? "<tr><th>batch_id</th><th>examples</th><th>idx</th><th>added</th></tr>" +
     b.slice(-6).reverse().map((x) => `<tr><td>${esc(x.batch_id.slice(0, 13))}…</td><td class="num">${n(x.rows)}</td><td class="num">${n(x.first_idx)}–${n(x.last_idx)}</td><td>${time(x.added_at)}</td></tr>`).join("")

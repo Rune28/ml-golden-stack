@@ -66,19 +66,19 @@ def test_write_predictions_is_idempotent_per_run(existing, deleted, inserted):
 
 class FakeReportClient:
     def __init__(self, done=0):
-        self.done, self.deleted, self.inserted = done, False, []
+        self.done, self.deleted, self.inserted = done, None, []
 
     def query(self, sql, parameters):
         return type("Result", (), {"result_rows": [[self.done]]})
 
     def command(self, sql, parameters):
-        self.deleted = True
+        self.deleted = parameters
 
     def insert(self, table, rows, column_names):
         self.inserted = rows
 
 
-def test_write_digit_report_skips_a_retry_and_replaces_an_old_report():
+def test_write_digit_report_touches_only_its_own_run():
     from jobs.clickhouse import write_digit_report
     from mnist.report import digit_report
 
@@ -86,9 +86,29 @@ def test_write_digit_report_skips_a_retry_and_replaces_an_old_report():
 
     retry = FakeReportClient(done=10)
     write_digit_report(retry, "pred-1", "report-1", "3", rows)
-    assert not retry.deleted and retry.inserted == []
+    assert retry.deleted is None and retry.inserted == []
 
+    # A new report on the same prediction run leaves the previous one alone:
+    # readers pick the latest through the digit_report_latest view.
     fresh = FakeReportClient(done=0)
     write_digit_report(fresh, "pred-1", "report-2", "3", rows)
-    assert fresh.deleted and len(fresh.inserted) == 10
-    assert fresh.inserted[3] == ["pred-1", "report-2", "3", 3, 1, 1]
+    assert fresh.deleted is None and len(fresh.inserted) == 10
+    # run_id and its old name report_run_id carry the same value until 0005 is contracted.
+    assert fresh.inserted[3] == ["pred-1", "report-2", "report-2", "3", 3, 1, 1]
+
+    partial = FakeReportClient(done=4)
+    write_digit_report(partial, "pred-1", "report-2", "3", rows)
+    assert partial.deleted == {"p": "pred-1", "r": "report-2"} and len(partial.inserted) == 10
+
+
+def test_commit_run_writes_one_marker_with_its_parents():
+    from datetime import datetime, timezone
+
+    from jobs.clickhouse import commit_run
+
+    client = FakeReportClient()
+    started = datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc)
+
+    commit_run(client, "report", "report-2", started, 10, {"prediction_run_id": "pred-1"})
+
+    assert client.inserted == [["report-2", "report", {"prediction_run_id": "pred-1"}, started, 10]]

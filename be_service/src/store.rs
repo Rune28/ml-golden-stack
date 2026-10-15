@@ -184,11 +184,15 @@ impl ClickHouse {
             .await?)
     }
 
-    /// The report on a prediction run, empty until the Report step ran on it.
+    /// The latest report on a prediction run, empty until the Report step ran
+    /// on it. Read through the view: the table keeps every report.
     pub async fn digit_report(&self, prediction_run_id: &str) -> Result<Vec<DigitCount>> {
         Ok(self
             .client
-            .query("SELECT digit, recognized, actual FROM digit_report WHERE prediction_run_id = ? ORDER BY digit")
+            .query(
+                "SELECT digit, recognized, actual FROM digit_report_latest \
+                 WHERE prediction_run_id = ? ORDER BY digit",
+            )
             .bind(prediction_run_id)
             .fetch_all()
             .await?)

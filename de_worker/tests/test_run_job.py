@@ -1,5 +1,6 @@
 import io
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 
@@ -55,6 +56,7 @@ class FakeS3:
 CONFIG = JobConfig(namespace="de-worker", image="ghcr.io/rune28/mle-models:dev-abc")
 TRAIN = JobRequest(step="train", run_id="r1", args=["--run-id", "r1"], pool="gpu", cpu="2", memory="1536Mi")
 RESULT = {("pipeline", "runs/r1/train/result.json"): {"version": "3", "accuracy": 0.95}}
+SCHEDULED = datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc)
 
 
 def runner(batch, s3=None):
@@ -68,15 +70,24 @@ def test_job_names_are_valid_dns_labels():
 
 def test_creates_a_gpu_job_and_returns_its_result():
     batch = FakeBatch([status(active=1), status(active=1), status(succeeded=1)])
+    env = ActivityEnvironment()
+    # A retry: this attempt began later, the step was scheduled at SCHEDULED.
+    env.info = replace(
+        env.info, attempt=2, scheduled_time=SCHEDULED, current_attempt_scheduled_time=datetime.now(timezone.utc)
+    )
 
-    result = ActivityEnvironment().run(runner(batch).run_job, TRAIN)
+    result = env.run(runner(batch).run_job, TRAIN)
 
     assert result == {"version": "3", "accuracy": 0.95}
     namespace, job = batch.created[0]
     pod = job.spec.template.spec
     container = pod.containers[0]
     assert (namespace, job.metadata.name) == ("de-worker", "train-r1")
-    assert container.args == ["--result-key", result_key("train", "r1"), "train", "--run-id", "r1"]
+    assert container.args == [
+        "--result-key", result_key("train", "r1"),
+        "--started-at", "2026-10-15T10:00:00+00:00",
+        "train", "--run-id", "r1",
+    ]
     assert container.resources.limits == {"cpu": "2", "memory": "1536Mi", "nvidia.com/gpu": "1"}
     assert pod.node_selector == {"node-pool": "gpu"}
     assert pod.tolerations[0].key == "nvidia.com/gpu"
