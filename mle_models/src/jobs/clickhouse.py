@@ -4,6 +4,7 @@ samples are written by be_service (Add data); the jobs only read them and
 write predictions."""
 
 import os
+from datetime import datetime
 
 import clickhouse_connect
 import numpy as np
@@ -79,3 +80,53 @@ def write_predictions(
             column_names=["run_id", "model_version", "idx", "label", "predicted", "confidence"],
             column_oriented=True,
         )
+
+
+def read_predictions(client, run_id: str) -> tuple[str, np.ndarray, np.ndarray]:
+    """Model version, predicted digits and true digits of one prediction run."""
+    result = client.query(
+        "SELECT any(model_version), groupArray(predicted), groupArray(label) FROM predictions WHERE run_id = {r:String}",
+        parameters={"r": run_id},
+    ).result_rows[0]
+    version, predicted, labels = result
+    if not predicted:
+        raise ValueError(f"no predictions for run {run_id}")
+    return version, np.asarray(predicted, dtype=np.uint8), np.asarray(labels, dtype=np.uint8)
+
+
+def write_digit_report(client, prediction_run_id: str, run_id: str, model_version: str, rows) -> None:
+    """Append-only: every report run keeps its own rows, and readers take the
+    latest one per prediction run from the digit_report_latest view. A retry
+    keeps a complete report and rewrites a partial one; either way only the
+    rows of this run are touched, never an earlier or a later report."""
+    own = {"p": prediction_run_id, "r": run_id}
+    done = client.query(
+        "SELECT count() FROM digit_report WHERE prediction_run_id = {p:String} AND run_id = {r:String}",
+        parameters=own,
+    ).result_rows[0][0]
+    if done == len(rows):
+        return
+    if done:
+        client.command(
+            "DELETE FROM digit_report WHERE prediction_run_id = {p:String} AND run_id = {r:String}", parameters=own
+        )
+    # report_run_id is the old name of run_id (migration 0005). Written as
+    # well until the contract step drops it: Jobs of the previous image may
+    # still be running and check their retries by it.
+    client.insert(
+        "digit_report",
+        [[prediction_run_id, run_id, run_id, model_version, r.digit, r.recognized, r.actual] for r in rows],
+        column_names=["prediction_run_id", "run_id", "report_run_id", "model_version", "digit", "recognized", "actual"],
+    )
+
+
+def commit_run(client, kind: str, run_id: str, started_at: datetime, rows: int, parents: dict[str, str]) -> None:
+    """The last action of a step that wrote rows: they are complete. Readers
+    see a run only through views over the `runs` registry. A repeated commit
+    (the Job retried after this point) is a duplicate that merges away."""
+    client.insert(
+        "runs",
+        [[run_id, kind, parents, started_at, rows]],
+        column_names=["run_id", "kind", "parents", "started_at", "rows"],
+    )
+

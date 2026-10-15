@@ -45,10 +45,29 @@ class RunResult:
 
 
 @dataclass
+class ReportInput:
+    # The prediction run to report on (be_service passes the latest one).
+    prediction_run_id: str
+    run_id: str = ""
+
+
+@dataclass
+class ReportResult:
+    run_id: str
+    prediction_run_id: str
+    model_version: str
+    total: int
+    # One entry per digit: {"digit", "recognized", "actual"}.
+    digits: list[dict]
+    most_over: dict
+    most_under: dict
+
+
+@dataclass
 class JobRequest:
     """One pipeline step as a Kubernetes Job running the mle-models image."""
 
-    step: str  # train | predict | promote
+    step: str  # train | predict | report | promote
     run_id: str
     args: list[str] = field(default_factory=list)
     pool: str = "cpu"  # node pool from the cluster contract: cpu | gpu

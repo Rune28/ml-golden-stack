@@ -14,10 +14,18 @@ N     ?= 5000
 POOL  ?= gpu
 MODEL ?= champion
 
+# OpenTofu state written by root can be updated only by root again. sudo is
+# usually reached for because docker refuses the user, and then the whole
+# make gets root; the fix is docker access for the user (make preflight).
+# Targets that need root (host-setup) call sudo themselves.
+ifeq ($(shell id -u),0)
+$(error do not run make as root: OpenTofu state written by root cannot be updated without it. Give your user access to docker instead, see make preflight)
+endif
+
 .PHONY: help infra-init infra-plan infra-up infra-down infra-status \
         platform-init platform-plan platform-up platform-down platform-status \
-        images images-load app-status add-data train run \
-        preflight host-setup test fmt validate
+        images images-load app-status add-data train run report \
+        preflight check-owner host-setup test fmt validate
 
 help:
 	@echo "preflight        check the host (tools, inotify limits, memory)"
@@ -36,11 +44,12 @@ help:
 	@echo "add-data N=5000  add the next N MNIST examples (be_service)"
 	@echo "train POOL=gpu   start the Train workflow"
 	@echo "run MODEL=champion  start the Run workflow"
+	@echo "report           start the Report workflow on the latest prediction run"
 	@echo "test             unit tests of be_service, de_worker and mle_models"
 	@echo "fmt              format OpenTofu code"
 	@echo "validate         validate OpenTofu code"
 
-infra-init:
+infra-init: check-owner
 	$(TOFU) -chdir=$(CLUSTER_DIR) init
 
 infra-plan: infra-init
@@ -49,6 +58,15 @@ infra-plan: infra-init
 preflight:
 	@$(CLUSTER_DIR)/scripts/preflight.sh
 
+# An earlier sudo make leaves state and .terraform owned by root, and init
+# fails with "permission denied". Found before anything runs, with the fix.
+check-owner:
+	@others=$$(find $(CLUSTER_DIR) $(ENV_DIR) ! -user "$$(id -un)" -print 2>/dev/null | head -5); \
+	if [ -n "$$others" ]; then \
+	  echo "OpenTofu files owned by another user (an earlier sudo make?):"; echo "$$others" | sed 's/^/  /'; \
+	  echo "fix once: sudo chown -R $$(id -un): $(CLUSTER_DIR) $(ENV_DIR)"; exit 1; \
+	fi
+
 # The only target that changes the host. Kept out of infra-up on purpose:
 # it needs sudo, and preflight tells you when to run it.
 host-setup:
@@ -56,12 +74,12 @@ host-setup:
 	  | sudo tee /etc/sysctl.d/99-kind.conf
 	sudo sysctl -p /etc/sysctl.d/99-kind.conf
 
-infra-up: preflight infra-init
+infra-up: check-owner preflight infra-init
 	$(TOFU) -chdir=$(CLUSTER_DIR) apply -auto-approve
 	@echo
 	@echo "export KUBECONFIG=$(KUBECONFIG)"
 
-infra-down:
+infra-down: check-owner
 	$(TOFU) -chdir=$(CLUSTER_DIR) destroy -auto-approve
 
 infra-status:
@@ -82,20 +100,21 @@ images-load:
 	DOCKER=$(DOCKER) scripts/images.sh load
 endif
 
-platform-init:
+platform-init: check-owner
 	$(TOFU) -chdir=$(ENV_DIR) init
 
 platform-plan: platform-init
 	$(TOFU) -chdir=$(ENV_DIR) plan
 
 # Images first: the applications are part of the platform apply, and the
-# image tags come from images.auto.tfvars.json.
-platform-up: images images-load platform-init
+# image tags come from images.auto.tfvars.json. check-owner before the
+# minutes of image builds, not after them.
+platform-up: check-owner images images-load platform-init
 	$(TOFU) -chdir=$(ENV_DIR) apply -auto-approve
 	@echo
 	@$(TOFU) -chdir=$(ENV_DIR) output
 
-platform-down:
+platform-down: check-owner
 	$(TOFU) -chdir=$(ENV_DIR) destroy -auto-approve
 
 platform-status:
@@ -122,6 +141,10 @@ run:
 	$(KUBECTL) -n temporal exec deploy/temporal-admintools -- temporal workflow start \
 	  --address temporal-frontend:7233 --task-queue de --type Run --workflow-id run \
 	  --input '{"model": "$(MODEL)"}'
+
+# Through be_service: it picks the latest prediction run.
+report:
+	@curl -sS -H 'content-type: application/json' -d '{}' http://127.0.0.1:9001/api/report; echo
 
 test:
 	cd be_service && cargo test

@@ -1,12 +1,15 @@
-# First pipeline: add data, train, run
+# First pipeline: add data, train, run, report
 
-A page with three buttons drives an MNIST classifier through every layer of the stack. Small on purpose: the value is in what happens behind the buttons.
+A page with four buttons drives an MNIST classifier through every layer of the stack. Small on purpose: the value is in what happens behind the buttons.
 
 | Button | What happens | Result |
 |---|---|---|
 | **Add data** | be_service inserts the next N MNIST training examples as one batch | rows in `ml_data.samples` under a new `batch_id` |
 | **Train model** | workflow `Train` → Job `train` on the `gpu` pool, then Job `promote` if the new model is better | MLflow run and a new version of `mnist-cnn`; alias `champion` |
 | **Run model** | workflow `Run` → Job `predict` | 10,000 rows in `ml_data.predictions` under the run's `run_id` |
+| **Report** | workflow `Report` → Job `report` on the latest prediction run | `ml_data.digit_report`: how many of each digit the model recognized, next to how many there are |
+
+Report answers "so what?" after recognition: the recognized digits are counted, and a digit the model leans towards (say, too many 8s, because it reads some 3s and 2s as 8) shows up as a bar past its true count. It is a separate workflow, not a step of Run: the same contract (`run_job`, one more subcommand in the image) carries a new kind of step without any platform change.
 
 Adding data and training again is the demo: accuracy goes from ~64% on 1,000 examples to ~95% on 10,000 and ~98.5% on all 60,000.
 
@@ -65,8 +68,8 @@ sequenceDiagram
 | Directory | Contents |
 |---|---|
 | `be_service/` | axum API and the page (`static/index.html`), ClickHouse ingest, Temporal client, MLflow REST |
-| `de_worker/src/workflow/` | `Train`, `Run`, `contracts.py`, `activities/run_job.py` |
-| `mle_models/src/` | `mnist` (IDX reader, CNN, train/predict), `jobs` (train, predict, promote) |
+| `de_worker/src/workflow/` | `Train`, `Run`, `Report`, `contracts.py`, `activities/run_job.py` |
+| `mle_models/src/` | `mnist` (IDX reader, CNN, train/predict, digit report), `jobs` (train, predict, report, promote) |
 | `db/clickhouse/migrations/` | `ml_data` and its tables |
 | `infra/charts/`, `infra/modules/` | how the applications and services are deployed |
 

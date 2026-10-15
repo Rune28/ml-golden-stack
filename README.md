@@ -4,6 +4,43 @@ Reference stack for multi-model batch ML pipelines: OpenTofu, Kubernetes, Kueue 
 
 > The first end-to-end pipeline runs: a page with three buttons adds MNIST data, trains a model on the (simulated) GPU pool and runs it, through Temporal, Kubernetes Jobs, ClickHouse and MLflow. Kueue, the cloud environments and the items in [BACKLOG.md](BACKLOG.md) are next.
 
+## Platform rules
+
+The decisions the stack is built on, in the order they were made. Each rule says why it exists and where it is in the code; what is not built yet links to the backlog.
+
+1. **Temporal orchestrates services across teams; it carries IDs, not data.** A workflow is the agreed process, each team implements its activities on its own task queue, and the contract is the names of workflows and activities and their payloads. Orchestration rather than choreography on purpose: a multi-step process that ends in a promotion decision has to be visible in one history. Data moves through ClickHouse and the object store.
+   *Here:* be_service (Rust) starts workflows, de_worker (Python) runs them, payloads in `de_worker/src/workflow/contracts.py`. *Not yet:* a second team's task queue, one schema for Rust and Python ([Contracts](BACKLOG.md#contracts-between-be_service-and-de_worker)).
+
+2. **Models are libraries behind a fixed API; the platform owns all I/O.** Data scientists build a model library against an agreed public API and test it on mock data; the platform wraps it into a Job. Both sides work in parallel, and the platform is tested end to end before a real model exists. A model is onboarded in four steps: run the notebook, keep its output as a golden test, move the code into the library, run it as a Job. It is accepted when the Job reproduces the notebook within an agreed tolerance.
+   *Here:* `mle_models/src/mnist` (no I/O), `mle_models/src/jobs` (ClickHouse, MLflow, S3). *Not yet:* a model interface that lets `jobs` run any library by name, an image per model, conformance tests on mock data.
+
+3. **The unit of execution is a disposable Kubernetes Job.** A step that gets all its inputs as arguments and leaves its result in the object store runs on any spot or GPU node of any cluster that meets the [cluster contract](#cluster-contract).
+   *Here:* `de_worker/src/workflow/activities/run_job.py`. *Not yet:* evictions not counted as failures, checkpoints ([Disruption tolerance](BACKLOG.md#disruption-tolerance)).
+
+4. **Capacity is managed by the queue, not by services.** Kueue decides which Job runs where and when; a new cluster is an OpenTofu module plus a Kueue registration (MultiKueue across clusters).
+   *Not yet:* planned, [Kueue](BACKLOG.md#kueue-queueing-pipeline-jobs).
+
+5. **Every table has one own key and inherits the keys of its inputs.** The own key is the run that wrote the rows: the unit of rewrite and idempotency. Inherited keys are what the rows were made from, so lineage is a join. A key keeps its name in every table: the own key is `run_id` (`batch_id` for source data), an inherited one is `<parent>_run_id`. A run writes and rewrites only its own rows, never those of another run.
+   *Here:* `db/clickhouse/migrations`. *What a wrong key costs:* `digit_report` was rewritten by its parent key, every new report deleting the previous ones by `prediction_run_id`, so an old report retried late wiped out a newer one. Fixing it took a chain, each patch exposing the next: the table became append-only; readers then needed a view to pick "the latest"; "the latest" by `created_at` turned out to be the time of the insert, not of the run, so a late retry won again; ordering by `run_id` instead would have required UUID v7 from every caller. The run registry (rule 11) settled it. Its own key was also named `report_run_id` against this rule (renamed by migration 0005, rule 10). *Not yet:* the source `batch_id` in `predictions` ([Lineage](BACKLOG.md#lineage)).
+
+6. **Every step is idempotent; contracts are fixed, implementations replaceable.** Retries happen at three levels (activity, pod, Job) and must never run a step twice: a retry finds the Job it created, a partial write is deleted and written again, a complete one is skipped. With input and output fixed, the body of a step can be rewritten, by a person or an AI assistant, without touching the rest.
+   *Here:* `run_job` (Job name from step and `run_id`), `write_predictions`, `be_service/src/ingest.rs`, with tests. *Not yet:* [idempotency gaps](BACKLOG.md#idempotency-of-pipeline-steps).
+
+7. **Critical functions have an owner who can explain every line.** Anything that writes or deletes shared data or moves a pointer (ingest, writing predictions, promotion) is written or reviewed line by line by the platform team and tested against retries and partial failures. Moving blocks of the pipeline later is safe only when these are understood.
+   *Here:* idempotency tests in `mle_models/tests`, `de_worker/tests`, `be_service/src/ingest.rs`. *Not yet:* CODEOWNERS, compare-and-set promotion ([Promotion safety](BACKLOG.md#promotion-safety)).
+
+8. **Promotion policy lives in the workflow.** The train step reports metrics, the workflow decides: the policy changes without rebuilding the image, and every decision is in the workflow history. The same champion/challenger can later choose between versions of data, not only of models.
+   *Here:* `de_worker/src/workflow/train.py`, MLflow alias `champion`. *Not yet:* a fixed evaluation set as an explicit contract, data-level promotion.
+
+9. **Two layers guard data quality.** CI runs the test cases that accumulate with every incident against every code change. In the pipeline, a validation gate before train and promote stops the workflow when the data breaks an invariant. CI catches regressions in code; the gate catches bad data that arrives while the code stays the same.
+   *Here:* unit tests of all three services in CI. *Not yet:* the gate, an end-to-end run on kind in CI, a model quality threshold.
+
+10. **Schema changes go expand, then contract.** Migrations run before the applications (`depends_on`), so a change must work with the previous release, including Jobs still running the previous image. Adding: migration first. Removing or renaming: code first, migration in a later release. An applied migration is never edited.
+    *Example:* `digit_report.report_run_id` was named against rule 5. Migration 0005 (expand) adds `run_id` with `DEFAULT report_run_id`, so the previous image, which writes only `report_run_id`, keeps working and old rows read the right value; the current image writes both. The contract step comes in a later release: `MATERIALIZE COLUMN run_id`, `MODIFY COLUMN run_id REMOVE DEFAULT`, `DROP COLUMN report_run_id`, in this order, since ClickHouse refuses to drop a column another column's default depends on.
+
+11. **A run exists for readers once it is committed to the run registry, and readers read only views.** A step writes its rows first and a marker in `ml_data.runs` last. Views join the data with the registry, so a run halfway through is never seen, and "the latest" run per parent is chosen by its logical start (when the workflow scheduled the step, the same on every retry), never by the time of an insert. The marker is written by the platform layer of the Job, not by model code, and the workflows do not change. `run_id` is unique across the platform and is the whole key of the registry, so a repeated commit merges away. Readers depend on views, writers on tables: a table can change its key or layout without any reader noticing. This is a small version of the snapshot commits of table formats such as Iceberg and Delta, and the way to them if the platform outgrows plain ClickHouse tables.
+    *Here:* migrations 0006–0009, `commit_run` in `mle_models/src/jobs/clickhouse.py`, `--started-at` from `run_job`; be_service reads `digit_report_latest`. *Not yet:* markers for batches, train reading committed batches only, views for the other reads of be_service, cleanup of uncommitted rows ([Run registry](BACKLOG.md#run-registry)).
+
 ## Layout
 
 | Directory | Purpose |
@@ -14,8 +51,8 @@ Reference stack for multi-model batch ML pipelines: OpenTofu, Kubernetes, Kueue 
 | `infra/envs/local` | local environment: wires the modules onto the kind cluster |
 | `db/clickhouse/migrations` | ClickHouse schema (golang-migrate, one statement per file) |
 | `be_service` | Rust: the page and its API. Adds data to ClickHouse, starts workflows in Temporal |
-| `de_worker` | Python: Temporal worker. Workflows `Train` and `Run`, activity `run_job` that runs a Kubernetes Job |
-| `mle_models` | Python: `mnist` (model code, no I/O) and `jobs` (the Job entry points: train, predict, promote) |
+| `de_worker` | Python: Temporal worker. Workflows `Train`, `Run` and `Report`, activity `run_job` that runs a Kubernetes Job |
+| `mle_models` | Python: `mnist` (model code, no I/O) and `jobs` (the Job entry points: train, predict, report, promote) |
 | `scripts/images.sh` | builds the application images and loads them into kind |
 
 ## Services
@@ -187,7 +224,7 @@ make infra-down
 
 `make platform-up` is the one command for everything above the cluster. It builds the three application images, tags them by content (`dev-<image id>`), loads into the kind nodes only what they miss, and applies `infra/envs/local`. A changed image gets a new tag and its pods roll; with nothing changed the apply is a no-op. `make platform-up IMAGES=remote TAG=sha-abc1234` takes the images CI published to GHCR instead.
 
-Do not run `make` with sudo: OpenTofu state written by root cannot be updated later without it.
+Do not run `make` with sudo: OpenTofu state written by root cannot be updated later without it. `make` refuses to run as root, and every target that runs OpenTofu first checks (`make check-owner`) that its files belong to you, printing the `chown` that fixes them. If docker needs sudo, give your user access to docker instead (`make preflight` says how).
 
 The kubeconfig is written to `infra/clusters/kind/.kubeconfig` (gitignored), so `~/.kube/config` is left untouched.
 
@@ -199,6 +236,7 @@ Open http://127.0.0.1:9001 and press the buttons in order, or use make:
 make add-data N=5000   # be_service adds the next 5000 MNIST examples as one batch
 make train POOL=gpu    # workflow Train: Job train on the gpu pool, promote if better
 make run               # workflow Run: the champion predicts all 10,000 test images
+make report            # workflow Report: what the recognized digits add up to
 ```
 
 Adding data and training again shows the point of the demo: accuracy grows with the data (about 64% on 1,000 examples, 95% on 10,000, 98.5% on all 60,000), and a new version becomes `champion` only when it beats the current one.
@@ -209,11 +247,12 @@ Adding data and training again shows the point of the demo: accuracy grows with 
 | Train | Temporal `Train` → de_worker `run_job` → Job `train` | MLflow run + new version of `mnist-cnn`, `result.json` |
 | Promote | decided in the workflow, Job `promote` | MLflow alias `champion` |
 | Run | Temporal `Run` → Job `predict` | `ml_data.predictions` under the run's `run_id` |
+| Report | Temporal `Report` → Job `report` on the latest prediction run | `ml_data.digit_report`: per digit, how many the model recognized and how many there are; every report is kept, the page reads the latest per prediction run through the view `digit_report_latest` |
 
 Contracts that hold the pieces together:
 
 - `batch_id` and `run_id` are generated by be_service per button press and travel through the workflow input, the Job arguments, ClickHouse and MLflow (`train_batches.json` lists the batches a model was trained on).
-- Workflow IDs are fixed (`train`, `run`): a second press while one runs is refused by Temporal.
+- Workflow IDs are fixed (`train`, `run`, `report`): a second press while one runs is refused by Temporal.
 - `run_job` names the Job `<step>-<run_id>`: a retried activity finds the Job it created instead of starting the step again. Every step is idempotent: a partial batch or prediction run is rewritten, a complete one skipped.
 - The `mnist` package has no I/O; `jobs` does ClickHouse, MLflow and S3 around it.
 

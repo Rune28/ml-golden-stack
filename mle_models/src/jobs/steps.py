@@ -3,6 +3,7 @@ contract with the de_worker activity that started the Job."""
 
 import json
 import logging
+from datetime import datetime
 
 import mlflow
 import mlflow.pytorch
@@ -12,6 +13,7 @@ from mlflow.types import Schema, TensorSpec
 
 from jobs import clickhouse, registry
 from mnist.model import IMAGE_SIZE, NUM_CLASSES
+from mnist.report import digit_report, most_biased
 from mnist.training import TrainConfig, accuracy, predict, to_tensor, train
 
 log = logging.getLogger(__name__)
@@ -68,7 +70,7 @@ def train_step(run_id: str, epochs: int, pool: str) -> dict:
     }
 
 
-def predict_step(run_id: str, model: str) -> dict:
+def predict_step(run_id: str, model: str, started_at: datetime) -> dict:
     """Predict the whole test split with a model version or alias, write the
     predictions under run_id."""
     version = registry.resolve(model)
@@ -78,6 +80,7 @@ def predict_step(run_id: str, model: str) -> dict:
     idx, labels, images, _ = clickhouse.read_split(client, "test")
     predicted, confidence = predict(net, images)
     clickhouse.write_predictions(client, run_id, version, idx, labels, predicted, confidence)
+    clickhouse.commit_run(client, "predict", run_id, started_at, len(idx), {"model_version": version})
 
     return {"run_id": run_id, "model_version": version, "accuracy": accuracy(predicted, labels), "rows": len(idx)}
 
@@ -85,3 +88,25 @@ def predict_step(run_id: str, model: str) -> dict:
 def promote_step(version: str) -> dict:
     registry.set_champion(version)
     return {"champion": version}
+
+
+def report_step(run_id: str, prediction_run_id: str, started_at: datetime) -> dict:
+    """The distribution of recognized digits in a prediction run, next to the
+    true one: what the recognition adds up to, and where the model leans."""
+    client = clickhouse.connect()
+    version, predicted, labels = clickhouse.read_predictions(client, prediction_run_id)
+    rows = digit_report(predicted, labels)
+    clickhouse.write_digit_report(client, prediction_run_id, run_id, version, rows)
+    clickhouse.commit_run(client, "report", run_id, started_at, len(rows), {"prediction_run_id": prediction_run_id})
+
+    over, under = most_biased(rows)
+    return {
+        "run_id": run_id,
+        "prediction_run_id": prediction_run_id,
+        "model_version": version,
+        "total": int(len(predicted)),
+        "digits": [{"digit": r.digit, "recognized": r.recognized, "actual": r.actual} for r in rows],
+        "most_over": {"digit": over.digit, "bias": over.bias},
+        "most_under": {"digit": under.digit, "bias": under.bias},
+    }
+

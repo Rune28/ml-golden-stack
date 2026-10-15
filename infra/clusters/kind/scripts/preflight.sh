@@ -18,7 +18,10 @@ done
 if docker info >/dev/null 2>&1; then
   ok "docker daemon reachable"
 else
-  fail "docker daemon not reachable" "start docker, and check that your user may use it: docker info"
+  # Not a reason for sudo make: state written by root breaks later runs.
+  fail "docker daemon not reachable without sudo" \
+    "start docker, and give your user access: sudo usermod -aG docker \$USER, then log in again" \
+    "(or rootless podman with KIND_EXPERIMENTAL_PROVIDER=podman); never run make with sudo"
 fi
 
 # Every kind node runs its own kubelet, containerd and kube-proxy, all using

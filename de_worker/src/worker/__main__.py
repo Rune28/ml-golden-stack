@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from workflow import TASK_QUEUE, RunWorkflow, TrainWorkflow
+from workflow import TASK_QUEUE, ReportWorkflow, RunWorkflow, TrainWorkflow
 from workflow.activities.run_job import JobRunner
 
 # run_job mostly sleeps between status polls; one thread per running Job.
@@ -25,7 +25,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[TrainWorkflow, RunWorkflow],
+        workflows=[TrainWorkflow, RunWorkflow, ReportWorkflow],
         activities=[runner.run_job],
         activity_executor=ThreadPoolExecutor(MAX_CONCURRENT_JOBS),
         max_concurrent_activities=MAX_CONCURRENT_JOBS,
